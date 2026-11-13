@@ -1,0 +1,24 @@
+# Android
+Android/.gradle/
+Android/build/
+Android/app/build/
+Android/local.properties
+Android/.idea/
+*.iml
+.cxx/
+*.keystore
+*.jks
+
+# Windows / Python
+PC/.venv*/
+PC/build/
+PC/dist/
+PC/*.log
+PC/*.spec
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db

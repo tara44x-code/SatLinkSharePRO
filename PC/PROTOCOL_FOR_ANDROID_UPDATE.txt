@@ -1,0 +1,16 @@
+SatLink Share PRO PC 4.0 / Android 3.0 (same protocol as PC 3.9 / Android 2.7)
+TCP port: 8988
+UDP discovery port: 8989
+Protocol header: SATLINK_SHARE_PRO_V3_RESUME
+Folder header: SATLINK_SHARE_PRO_V4_FOLDERS
+For V4 each file name is a UTF relative path rooted at the selected folder, e.g. Pictures/Trip/photo.jpg.
+Metadata and streaming/resume framing are unchanged from V3. Both updated receivers accept V3 and V4.
+Folder transfer requires updated sender and receiver. Empty directories are not transmitted.
+Discovery request: SATLINK_SHARE_PRO_DISCOVER_V1
+Discovery response: SATLINK_SHARE_PRO_RESPONSE_V1|<name>|8988
+
+PC v3.1 can:
+- respond to Android discovery so PC appears in Android devices list
+- scan for Android receivers
+- receive files from Android using Java DataOutputStream/DataInputStream protocol
+- send files to Android using the same protocol

@@ -1,0 +1,6 @@
+<resources>
+    <color name="satlink_bg">#04050A</color>
+    <color name="satlink_cyan">#00DCFF</color>
+    <color name="satlink_purple">#9646FF</color>
+    <color name="icon_bg">#03081E</color>
+</resources>

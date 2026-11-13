@@ -1,0 +1,10 @@
+<resources>
+    <style name="AppTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/satlink_bg</item>
+        <item name="android:statusBarColor">@color/satlink_bg</item>
+        <item name="android:navigationBarColor">@color/satlink_bg</item>
+        <item name="android:colorAccent">@color/satlink_cyan</item>
+        <item name="android:colorPrimary">@color/satlink_purple</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
