@@ -105,7 +105,8 @@ public class ReceiverServer {
                 out.flush();
                 return;
             }
-            boolean folderProtocol = SenderClient.FOLDER_PROTOCOL.equals(header);
+            boolean ackProtocol = SenderClient.ACK_PROTOCOL.equals(header);
+            boolean folderProtocol = ackProtocol || SenderClient.FOLDER_PROTOCOL.equals(header);
             if (!folderProtocol && !SenderClient.PROTOCOL.equals(header)) throw new IllegalStateException("اتصال غير معروف أو نسخة قديمة");
             String senderName = in.readUTF();
             int count = in.readInt();
@@ -130,6 +131,17 @@ public class ReceiverServer {
                 if (resumeFrom < 0 || resumeFrom > total) {
                     FileStoreUtils.resetPartial(context, fileName, total);
                     resumeFrom = 0L;
+                }
+                String recentKey = senderName + "\u0000" + fileName + "\u0000" + total;
+                Uri alreadySaved = ackProtocol && resumeFrom == 0 ? recentlySaved(recentKey) : null;
+                if (alreadySaved != null) {
+                    // وصل كاملاً وانحفظ قبل قليل لكن تأكيده ضاع مع انقطاع الاتصال: لا نحفظ نسخة ثانية.
+                    out.writeLong(total);
+                    out.writeLong(total);
+                    out.flush();
+                    listener.onFileStarted(session, senderName, fileName, total, total);
+                    listener.onFileSaved(session, fileName, total, alreadySaved);
+                    continue;
                 }
                 out.writeLong(resumeFrom);
                 out.flush();
@@ -163,7 +175,13 @@ public class ReceiverServer {
                 listener.onProgress(session, fileName, received, total, 0);
                 Uri saved = FileStoreUtils.copyPartialToDownloads(context, fileName, total);
                 FileStoreUtils.deletePartial(context, fileName, total);
+                rememberSaved(recentKey, saved);
                 listener.onFileSaved(session, fileName, total, saved);
+                if (ackProtocol) {
+                    // تأكيد للمرسل أن الملف وصل وانحفظ كاملاً، وبعدها فقط يبدأ الملف التالي.
+                    out.writeLong(total);
+                    out.flush();
+                }
             }
             completed = true;
         } catch (Exception e) {
@@ -174,6 +192,21 @@ public class ReceiverServer {
             active.remove(socket);
             if (started) listener.onSessionEnded(session, completed, wasCancelled);
         }
+    }
+
+    private static final long RECENT_MS = 15 * 60 * 1000L;
+    private final java.util.HashMap<String, Object[]> recent = new java.util.HashMap<>();
+
+    private synchronized Uri recentlySaved(String key) {
+        long now = System.currentTimeMillis();
+        java.util.Iterator<java.util.Map.Entry<String, Object[]>> it = recent.entrySet().iterator();
+        while (it.hasNext()) if (now - (Long) it.next().getValue()[1] > RECENT_MS) it.remove();
+        Object[] v = recent.get(key);
+        return v == null ? null : (Uri) v[0];
+    }
+
+    private synchronized void rememberSaved(String key, Uri uri) {
+        if (uri != null) recent.put(key, new Object[]{uri, System.currentTimeMillis()});
     }
 
     private void closeServerQuietly() {

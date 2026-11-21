@@ -14,12 +14,15 @@ except ImportError:
     QT_BINDING = "PyQt5"
 
 APP_NAME = "SatLink Share PRO"
-APP_VERSION = "4.0-NEON"
+APP_VERSION = "4.1"
 DEVELOPER = "مهند سات لنك"
 ANDROID_TCP_PORT = 8988
 ANDROID_UDP_PORT = 8989
 ANDROID_PROTOCOL = "SATLINK_SHARE_PRO_V3_RESUME"
 FOLDER_PROTOCOL = "SATLINK_SHARE_PRO_V4_FOLDERS"
+# V5: like V4, plus the receiver confirms each saved file (8-byte size) before the next one.
+ACK_PROTOCOL = "SATLINK_SHARE_PRO_V5_ACK"
+MAX_SEND_ATTEMPTS = 10
 DISCOVER = "SATLINK_SHARE_PRO_DISCOVER_V1"
 RESPONSE_PREFIX = "SATLINK_SHARE_PRO_RESPONSE_V1|"
 PING_PROTOCOL = "SATLINK_SHARE_PRO_PING_V1"
@@ -280,6 +283,9 @@ class ReceiverServer:
     def __init__(self, bus):
         self.bus = bus; self.stop_event = threading.Event(); self.thread = None; self.udp_thread = None; self.sock = None; self.udp_sock = None
         self.active_client = None; self.cancelled_client = None; self.active_lock = threading.Lock()
+        # Files saved in the last minutes, so a sender that reconnects because the
+        # confirmation got lost is told "already complete" instead of sending a duplicate.
+        self.recent = {}; self.recent_lock = threading.Lock()
     def cancel_current(self):
         with self.active_lock:
             client = self.active_client
@@ -306,8 +312,13 @@ class ReceiverServer:
     def stop(self):
         self.stop_event.set()
         try:
+            # shutdown() wakes the thread blocked in accept() so the port is really freed.
+            if self.sock: self.sock.shutdown(socket.SHUT_RDWR)
+        except Exception: pass
+        try:
             if self.sock: self.sock.close()
         except Exception: pass
+        if self.thread and self.thread is not threading.current_thread(): self.thread.join(2)
         try:
             if self.udp_sock: self.udp_sock.close()
         except Exception: pass
@@ -355,7 +366,7 @@ class ReceiverServer:
                 write_int(sock, ANDROID_TCP_PORT)
                 self.bus.log.emit("تم الرد على فحص ظهور الحاسبة من الموبايل")
                 return
-            if protocol not in (ANDROID_PROTOCOL, FOLDER_PROTOCOL): raise RuntimeError("بروتوكول غير معروف: " + protocol)
+            if protocol not in (ANDROID_PROTOCOL, FOLDER_PROTOCOL, ACK_PROTOCOL): raise RuntimeError("بروتوكول غير معروف: " + protocol)
             sender_name = read_utf(sock); count = read_int(sock); total_bytes = read_long(sock)
             if not 0 <= count <= 10000 or total_bytes < 0:
                 raise ValueError("بيانات إرسال غير صالحة")
@@ -363,19 +374,28 @@ class ReceiverServer:
             try:
                 save = downloads_received_dir()
             except OSError:
-                write_bool(sock, False)
                 self.bus.log.emit("مكان الحفظ غير متوفر؛ وصل القرص أو اختر مكاناً آخر")
+                write_bool(sock, False)
                 return
             write_bool(sock, True)
             with self.active_lock: self.active_client = sock
             total_received_all = 0; start_all = time.time()
             for index in range(count):
                 raw_name = read_utf(sock)
-                relative = safe_relative_path(raw_name) if protocol == FOLDER_PROTOCOL else Path(safe_filename(raw_name))
+                relative = safe_relative_path(raw_name) if protocol in (FOLDER_PROTOCOL, ACK_PROTOCOL) else Path(safe_filename(raw_name))
                 filename = relative.as_posix(); size = read_long(sock)
                 current_name = filename; current_size = size
                 if size < 0: raise ValueError("حجم الملف غير صالح")
                 part = partial_path(save, sender_name, filename, size)
+                recent_key = (sender_name, filename, size)
+                with self.recent_lock:
+                    now = time.monotonic()
+                    self.recent = {k: t for k, t in self.recent.items() if now - t < 900}
+                    already_saved = protocol == ACK_PROTOCOL and recent_key in self.recent and not part.exists()
+                if already_saved:
+                    write_long(sock, size); write_long(sock, size)
+                    transfer_update(self.bus, "استلام", filename, size, size, time.monotonic(), "مكتمل")
+                    continue
                 resume_from = part.stat().st_size if part.exists() else 0
                 if resume_from > size:
                     part.unlink(); resume_from = 0
@@ -398,6 +418,8 @@ class ReceiverServer:
                 destination_dir.mkdir(parents=True, exist_ok=True)
                 out_path = unique_destination(destination_dir, relative.name)
                 os.replace(part, out_path)
+                with self.recent_lock: self.recent[recent_key] = time.monotonic()
+                if protocol == ACK_PROTOCOL: write_long(sock, size)  # confirm: saved completely
                 transfer_update(self.bus, "استلام", filename, size, size, started, "مكتمل")
                 self.bus.log.emit(f"تم حفظ الملف: {out_path.name}")
             speed = (total_received_all / 1024 / 1024) / max(time.time() - start_all, 0.01)
@@ -546,56 +568,101 @@ class Sender:
     def is_busy(self): return self.current_socket is not None
     def send_files(self, host, port, file_paths): threading.Thread(target=self._send_android_protocol, args=(host, int(port), file_paths), daemon=True).start()
     def _send_android_protocol(self, host, port, file_paths):
-        s = None; self.cancelled.clear()
-        current_name = None; current_done = 0; current_size = 0; current_started = 0
+        """Send a batch. Each file counts as done only after the receiver confirms it was
+        saved; on a dropped connection it reconnects and resumes from the last byte."""
+        self.cancelled.clear()
+        self._current = {"name": None, "done": 0, "size": 0, "started": 0}
         try:
             files = selected_entries(file_paths)
             if not files: self.bus.log.emit("لم يتم اختيار ملفات صالحة."); return
+            finished = set(); legacy = False; attempt = 0; start = time.time()
             total_size = sum(size for _, _, size in files)
-            protocol = FOLDER_PROTOCOL if any("/" in name for _, name, _ in files) else ANDROID_PROTOCOL
-            # Android waits up to 60 seconds for the user to accept the request.
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); self.current_socket = s; s.settimeout(120); tune_socket(s)
+            while not self.cancelled.is_set():
+                remaining = [f for f in files if f[1] not in finished]
+                if not remaining: break
+                attempt += 1
+                try:
+                    self._send_once(host, port, remaining, finished, not legacy)
+                    break
+                except _LegacyReceiver:
+                    legacy = True; attempt -= 1
+                    self.bus.log.emit("الجهاز المستلم بنسخة قديمة؛ يُفضّل تحديثه")
+                except _Rejected:
+                    self.bus.log.emit("تم رفض الاستلام من الجهاز الآخر"); return
+                except (OSError, ConnectionError, EOFError, struct.error) as e:
+                    if self.cancelled.is_set(): raise
+                    if attempt >= MAX_SEND_ATTEMPTS: raise
+                    self.bus.log.emit(f"انقطع الاتصال، إعادة المحاولة {attempt} والإكمال من آخر نقطة...")
+                    time.sleep(min(8.0, 1.5 * attempt))
+            if self.cancelled.is_set(): raise ConnectionError("cancelled")
+            speed = (total_size / 1024 / 1024) / max(time.time() - start, 0.01)
+            self.bus.log.emit(f"اكتمل الإرسال إلى الجهاز | السرعة {speed:.2f} MB/s"); self.bus.progress.emit(100)
+        except Exception as e:
+            c = self._current
+            if self.cancelled.is_set():
+                if c["name"]: transfer_update(self.bus, "إرسال", c["name"], c["done"], c["size"], c["started"], "ملغي")
+                self.bus.log.emit("تم إلغاء الإرسال الحالي")
+            else:
+                if c["name"]: transfer_update(self.bus, "إرسال", c["name"], c["done"], c["size"], c["started"], "فشل")
+                self.bus.log.emit(f"فشل الإرسال إلى الجهاز: {e}")
+
+    def _send_once(self, host, port, files, finished, ack):
+        total_size = sum(size for _, _, size in files)
+        if ack: protocol = ACK_PROTOCOL
+        else: protocol = FOLDER_PROTOCOL if any("/" in name for _, name, _ in files) else ANDROID_PROTOCOL
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); self.current_socket = s
+        try:
+            s.settimeout(120); tune_socket(s)
             self.bus.log.emit(f"الاتصال بالجهاز {host}:{port} ..."); s.connect((host, port))
-            write_utf(s, protocol); write_utf(s, pc_name()); write_int(s, len(files)); write_long(s, total_size)
-            if not read_bool(s): self.bus.log.emit("تم رفض الاستلام من الجهاز الآخر"); return
+            try:
+                write_utf(s, protocol); write_utf(s, pc_name()); write_int(s, len(files)); write_long(s, total_size)
+                accepted = read_bool(s)
+            except socket.timeout:
+                raise
+            except (OSError, ConnectionError):
+                # Older receivers close the connection on a header they don't know.
+                if ack: raise _LegacyReceiver()
+                raise
+            if not accepted: raise _Rejected()
             self.bus.log.emit("تم قبول الطلب، بدأ الإرسال")
-            sent_all = 0; start = time.time()
+            sent_all = 0
             for p, relative_name, size in files:
-                if self.cancelled.is_set(): break
+                if self.cancelled.is_set(): return
                 write_utf(s, relative_name); write_long(s, size); resume_from = read_long(s)
-                current_name = relative_name; current_size = size; current_done = resume_from; current_started = time.monotonic()
                 if resume_from < 0 or resume_from > size: resume_from = 0
+                started = time.monotonic()
+                self._current = {"name": relative_name, "done": resume_from, "size": size, "started": started}
                 if resume_from: self.bus.log.emit(f"استئناف {relative_name} من {resume_from/1024/1024:.2f} MB")
+                sent_all += resume_from
                 with open(p, "rb", buffering=IO_BUFFER) as f:
-                    if resume_from: f.seek(resume_from); sent_all += resume_from
+                    if resume_from: f.seek(resume_from)
                     self.bus.log.emit(f"إرسال: {relative_name} ({size/1024/1024:.2f} MB)")
-                    remaining = size - resume_from
-                    started = current_started; last_ui = 0
+                    remaining = size - resume_from; last_ui = 0
                     transfer_update(self.bus, "إرسال", relative_name, resume_from, size, started, "جاري", resume_from)
                     while remaining and not self.cancelled.is_set():
                         chunk = f.read(min(IO_BUFFER, remaining))
-                        if not chunk: raise EOFError(f"الملف أقصر من حجمه المعلن: {relative_name}")
-                        s.sendall(chunk); sent_all += len(chunk); current_done += len(chunk)
+                        if not chunk: raise ValueError(f"الملف أقصر من حجمه المعلن: {relative_name}")
+                        s.sendall(chunk); sent_all += len(chunk); self._current["done"] += len(chunk)
                         remaining -= len(chunk)
                         self.bus.progress.emit(max(0, min(100, int(sent_all * 100 / max(1, total_size)))))
                         now = time.monotonic()
                         if now - last_ui >= 0.3:
-                            transfer_update(self.bus, "إرسال", relative_name, size - remaining, size, started, "جاري", resume_from); last_ui = now
-                    if self.cancelled.is_set():
-                        transfer_update(self.bus, "إرسال", relative_name, size - remaining, size, started, "ملغي"); return
-                    transfer_update(self.bus, "إرسال", relative_name, size, size, started, "مكتمل")
-            speed = (total_size / 1024 / 1024) / max(time.time() - start, 0.01)
-            self.bus.log.emit(f"اكتمل الإرسال إلى الجهاز | السرعة {speed:.2f} MB/s"); self.bus.progress.emit(100)
-        except Exception as e:
-            if self.cancelled.is_set():
-                if current_name: transfer_update(self.bus, "إرسال", current_name, current_done, current_size, current_started, "ملغي")
-                self.bus.log.emit("تم إلغاء الإرسال الحالي")
-            else: self.bus.log.emit(f"فشل الإرسال إلى الجهاز: {e}")
+                            # Keep 99% until the receiver confirms the file was saved.
+                            shown = min(size - remaining, max(0, size - 1)) if ack else size - remaining
+                            transfer_update(self.bus, "إرسال", relative_name, shown, size, started, "جاري", resume_from); last_ui = now
+                    if self.cancelled.is_set(): return
+                if ack:
+                    transfer_update(self.bus, "إرسال", relative_name, max(0, size - 1), size, started, "جاري", resume_from)
+                    if read_long(s) != size: raise ConnectionError(f"المستلم لم يحفظ الملف كاملاً: {relative_name}")
+                finished.add(relative_name)
+                transfer_update(self.bus, "إرسال", relative_name, size, size, started, "مكتمل")
         finally:
-            try:
-                if s: s.close()
-            except Exception: pass
+            try: s.close()
+            except OSError: pass
             if self.current_socket is s: self.current_socket = None
+
+class _LegacyReceiver(Exception): pass
+class _Rejected(Exception): pass
 
 def asset_path(name) -> Path:
     return Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "assets" / name

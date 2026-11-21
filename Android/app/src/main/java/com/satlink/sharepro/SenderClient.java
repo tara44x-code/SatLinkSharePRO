@@ -20,8 +20,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class SenderClient {
     public static final String PROTOCOL = "SATLINK_SHARE_PRO_V3_RESUME";
     public static final String FOLDER_PROTOCOL = "SATLINK_SHARE_PRO_V4_FOLDERS";
+    /**
+     * V5: مثل V4 لكن المستلم يرسل تأكيداً (عدد البايتات المحفوظة) بعد حفظ كل ملف،
+     * والمرسل لا يعتبر الملف مكتملاً ولا يغلق الاتصال قبل وصول التأكيد.
+     */
+    public static final String ACK_PROTOCOL = "SATLINK_SHARE_PRO_V5_ACK";
     private static final int BUFFER = 512 * 1024;
-    private static final int MAX_ATTEMPTS = 5;
+    private static final int MAX_ATTEMPTS = 10;
 
     public interface Listener {
         void onLog(String message);
@@ -62,6 +67,7 @@ public class SenderClient {
             for (FileItem item : files)
                 if (item.size < 0) throw new IllegalArgumentException("حجم ملف غير معروف: " + item.name);
             int attempt = 0;
+            boolean legacy = false;
             java.util.HashSet<String> finished = new java.util.HashSet<>();
             while (!cancelled.get()) {
                 attempt++;
@@ -71,9 +77,14 @@ public class SenderClient {
                     long remainingBytes = 0L;
                     for (FileItem item : files) if (!finished.contains(item.name)) { remaining.add(item); remainingBytes += item.size; }
                     if (remaining.isEmpty()) { completed = true; break; }
-                    sendOnce(batch, device, remaining, remainingBytes, finished);
+                    sendOnce(batch, device, remaining, remainingBytes, finished, !legacy);
                     completed = !cancelled.get();
                     break;
+                } catch (LegacyPeerException e) {
+                    // نسخة قديمة عند المستلم لا تعرف التأكيد: نرسل بالبروتوكول القديم.
+                    legacy = true;
+                    attempt--;
+                    listener.onLog("الجهاز المستلم بنسخة قديمة؛ يُفضّل تحديثه");
                 } catch (IOException e) {
                     if (cancelled.get()) break;
                     if (e instanceof RejectedException || attempt >= MAX_ATTEMPTS) throw e;
@@ -94,7 +105,11 @@ public class SenderClient {
         RejectedException(String message) { super(message); }
     }
 
-    private void sendOnce(String batch, DeviceInfo device, List<FileItem> files, long totalBytes, java.util.Set<String> finished) throws IOException {
+    private static final class LegacyPeerException extends IOException {
+        LegacyPeerException() { super("legacy receiver"); }
+    }
+
+    private void sendOnce(String batch, DeviceInfo device, List<FileItem> files, long totalBytes, java.util.Set<String> finished, boolean ack) throws IOException {
         Socket socket = new Socket();
         currentSocket = socket;
         try {
@@ -109,13 +124,20 @@ public class SenderClient {
 
             boolean hasFolders = false;
             for (FileItem item : files) if (item.name.contains("/")) { hasFolders = true; break; }
-            out.writeUTF(hasFolders ? FOLDER_PROTOCOL : PROTOCOL);
-            out.writeUTF(NetworkUtils.getDeviceName());
-            out.writeInt(files.size());
-            out.writeLong(totalBytes);
-            out.flush();
-
-            if (!in.readBoolean()) throw new RejectedException("الجهاز الآخر رفض الاستلام");
+            boolean accepted;
+            try {
+                out.writeUTF(ack ? ACK_PROTOCOL : hasFolders ? FOLDER_PROTOCOL : PROTOCOL);
+                out.writeUTF(NetworkUtils.getDeviceName());
+                out.writeInt(files.size());
+                out.writeLong(totalBytes);
+                out.flush();
+                accepted = in.readBoolean();
+            } catch (IOException e) {
+                // المستلم القديم يغلق الاتصال فوراً عند بروتوكول لا يعرفه.
+                if (ack && !(e instanceof java.net.SocketTimeoutException)) throw new LegacyPeerException();
+                throw e;
+            }
+            if (!accepted) throw new RejectedException("الجهاز الآخر رفض الاستلام");
 
             byte[] buffer = new byte[BUFFER];
             for (FileItem item : files) {
@@ -129,6 +151,7 @@ public class SenderClient {
                 if (resumeFrom < 0 || resumeFrom > size) resumeFrom = 0L;
                 listener.onFileStarted(batch, item.name, size, resumeFrom);
                 if (resumeFrom >= size) {
+                    if (ack && in.readLong() != size) throw new IOException("المستلم لم يحفظ الملف كاملاً: " + item.name);
                     listener.onProgress(batch, item.name, size, size, 0);
                     finished.add(item.name);
                     listener.onFileFinished(batch, item.name);
@@ -158,6 +181,12 @@ public class SenderClient {
                 if (cancelled.get()) return;
                 out.flush();
                 if (sent != size) throw new IllegalStateException("الملف تغيّر أثناء الإرسال: " + item.name);
+                if (ack) {
+                    // البيانات خرجت من هذا الجهاز لكن قد تكون بالطريق؛ ننتظر تأكيد الحفظ من المستلم.
+                    listener.onProgress(batch, item.name, Math.max(0, size - 1), size, 0);
+                    long saved = in.readLong();
+                    if (saved != size) throw new IOException("المستلم لم يحفظ الملف كاملاً: " + item.name);
+                }
                 listener.onProgress(batch, item.name, sent, size, 0);
                 finished.add(item.name);
                 listener.onFileFinished(batch, item.name);

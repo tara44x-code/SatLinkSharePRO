@@ -1,4 +1,4 @@
-SatLink Share PRO PC 4.0 / Android 3.0 (same protocol as PC 3.9 / Android 2.7)
+SatLink Share PRO PC 4.1 / Android 3.1
 TCP port: 8988
 UDP discovery port: 8989
 Protocol header: SATLINK_SHARE_PRO_V3_RESUME
@@ -14,3 +14,11 @@ PC v3.1 can:
 - scan for Android receivers
 - receive files from Android using Java DataOutputStream/DataInputStream protocol
 - send files to Android using the same protocol
+
+V5 (Android 3.1 / PC 4.1): header SATLINK_SHARE_PRO_V5_ACK. Same as V4 (relative paths), plus:
+after the last byte of each file the receiver saves it, then writes an 8-byte long = file size.
+The sender marks the file complete and starts the next one only after this confirmation.
+If the receiver already saved the same file (same sender, name, size) in the last 15 minutes and
+the confirmation was lost, it answers resume = size followed by the confirmation, so no duplicate is made.
+Senders try V5 first and fall back to V3/V4 if an older receiver closes the connection.
+Senders reconnect up to 10 times and resume from the last byte.

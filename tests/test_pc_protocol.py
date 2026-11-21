@@ -1,6 +1,7 @@
 """Protocol tests without the optional Qt GUI dependency."""
 import importlib.util
 import json
+import os
 import socket
 import sys
 import tempfile
@@ -268,6 +269,97 @@ class ProtocolTests(unittest.TestCase):
                     self.assertEqual(f.read(1), b"Q")
                 self.assertFalse(any("فشل الإرسال" in msg for msg in sender_bus.log.values))
                 self.assertTrue(any(x[0] == "إرسال" and x[1] == huge.name and x[-1] == "مكتمل" for x in sender_bus.transfer.values))
+            finally:
+                receiver.stop()
+
+    def _free_port(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def test_sender_waits_for_receiver_confirmation(self):
+        """A file is 'مكتمل' on the sender only after the receiver saved it (V5)."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); source = root / "game.apk"; source.write_bytes(b"G" * 200000)
+            port = self._free_port(); saved = threading.Event(); events = []
+            server = socket.socket(); server.bind(("127.0.0.1", port)); server.listen(1)
+            def slow_receiver():
+                conn, _ = server.accept()
+                with conn:
+                    self.assertEqual(satlink.read_utf(conn), satlink.ACK_PROTOCOL)
+                    satlink.read_utf(conn); satlink.read_int(conn); satlink.read_long(conn)
+                    satlink.write_bool(conn, True)
+                    satlink.read_utf(conn); size = satlink.read_long(conn); satlink.write_long(conn, 0)
+                    satlink.read_exact(conn, size)
+                    time.sleep(0.5)  # still writing the file to disk
+                    events.append("saved"); saved.set()
+                    satlink.write_long(conn, size)
+            t = threading.Thread(target=slow_receiver, daemon=True); t.start()
+            bus = Bus()
+            original = bus.transfer.emit
+            def record(*values):
+                if values[-1] == "مكتمل": events.append("sender-complete")
+                original(*values)
+            bus.transfer.emit = record
+            satlink.Sender(bus)._send_android_protocol("127.0.0.1", port, [str(source)])
+            t.join(5); server.close()
+            self.assertEqual(events, ["saved", "sender-complete"])
+
+    def test_legacy_receiver_fallback(self):
+        """An old receiver that closes on the V5 header still gets the files via V3."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); source = root / "video.mp4"; source.write_bytes(b"V" * 5000)
+            port = self._free_port(); got = {}
+            server = socket.socket(); server.bind(("127.0.0.1", port)); server.listen(2)
+            def old_receiver():
+                for _ in range(2):
+                    conn, _ = server.accept()
+                    with conn:
+                        header = satlink.read_utf(conn)
+                        if header != satlink.ANDROID_PROTOCOL: continue  # old versions just hang up
+                        satlink.read_utf(conn); satlink.read_int(conn); satlink.read_long(conn)
+                        satlink.write_bool(conn, True)
+                        name = satlink.read_utf(conn); size = satlink.read_long(conn); satlink.write_long(conn, 0)
+                        got[name] = satlink.read_exact(conn, size)
+                        return
+            t = threading.Thread(target=old_receiver, daemon=True); t.start()
+            bus = Bus()
+            satlink.Sender(bus)._send_android_protocol("127.0.0.1", port, [str(source)])
+            t.join(5); server.close()
+            self.assertEqual(got.get("video.mp4"), source.read_bytes())
+            self.assertFalse(any("فشل الإرسال" in m for m in bus.log.values))
+
+    def test_multi_file_batch_resumes_after_drop(self):
+        """Video + app + game: the connection drops in the middle of the 2nd file and
+        the sender reconnects, skips the confirmed file and finishes the rest."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); save = root / "save"; save.mkdir()
+            sources = []
+            for name, size in (("film.mp4", 900000), ("app.apk", 700000), ("game.obb", 400000)):
+                p = root / name; p.write_bytes(os.urandom(size)); sources.append(p)
+            satlink.downloads_received_dir = lambda: save
+            satlink.ANDROID_TCP_PORT = self._free_port()
+            receiver = satlink.ReceiverServer(Bus()); receiver.start()
+            dropped = {"done": False}; sent = {}
+            real_sendall = socket.socket.sendall
+            def flaky_sendall(sock, data, *args):
+                real_sendall(sock, data, *args)
+                if sock.getsockname()[1] == satlink.ANDROID_TCP_PORT: return  # receiver side
+                total = sent.get(id(sock), 0) + len(data); sent[id(sock)] = total
+                if not dropped["done"] and total > 900000 + 300000:
+                    dropped["done"] = True
+                    sock.shutdown(socket.SHUT_RDWR); raise ConnectionResetError("simulated drop")
+            try:
+                time.sleep(0.15)
+                bus = Bus()
+                with patch.object(socket.socket, "sendall", flaky_sendall), patch.object(satlink.time, "sleep", lambda *_: None):
+                    satlink.Sender(bus)._send_android_protocol("127.0.0.1", satlink.ANDROID_TCP_PORT, [str(p) for p in sources])
+                self.assertTrue(dropped["done"])
+                for p in sources:
+                    self._wait_for(lambda p=p: (save / p.name).exists())
+                    self.assertEqual((save / p.name).read_bytes(), p.read_bytes())
+                self.assertEqual(sorted(x.name for x in save.iterdir() if x.is_file()), sorted(p.name for p in sources), bus.log.values)
+                self.assertTrue(any("إعادة المحاولة" in m for m in bus.log.values))
             finally:
                 receiver.stop()
 
