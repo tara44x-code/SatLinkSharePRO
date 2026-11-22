@@ -67,6 +67,8 @@ public class ReceiverServer {
     private final Set<Socket> active = java.util.Collections.newSetFromMap(new ConcurrentHashMap<>());
     private final Set<Socket> cancelled = java.util.Collections.newSetFromMap(new ConcurrentHashMap<>());
     private final Map<String, V6Session> v6Sessions = new ConcurrentHashMap<>();
+    /** محاولات سابقة لنفس الدفعة (نفس المرسل): تُغلق قبل حساب نقاط الإكمال حتى لا يكتب اتصالان نفس الملف. */
+    private final Map<String, List<Object[]>> batchAttempts = new HashMap<>();
     private volatile ServerSocket serverSocket;
 
     public ReceiverServer(Context context, Listener listener) {
@@ -270,6 +272,7 @@ public class ReceiverServer {
         String session = System.currentTimeMillis() + "-" + sessions.incrementAndGet();
         boolean started = false, completed = false;
         String keyHex = null;
+        Object[] claimed = null;
         V6Session state = new V6Session();
         try {
             DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream(), BUFFER));
@@ -290,6 +293,21 @@ public class ReceiverServer {
                 sizes[i] = in.readLong();
                 if (sizes[i] < 0) throw new IllegalStateException("حجم ملف غير صالح");
                 if (preview.size() < 5) preview.add(names[i]);
+            }
+            String claim = senderId + "|" + batch;
+            java.util.concurrent.CountDownLatch finished = new java.util.concurrent.CountDownLatch(1);
+            claimed = new Object[]{claim, s, finished};
+            List<Object[]> earlier;
+            synchronized (batchAttempts) {
+                List<Object[]> list = batchAttempts.get(claim);
+                if (list == null) { list = new ArrayList<>(); batchAttempts.put(claim, list); }
+                earlier = new ArrayList<>(list);
+                list.add(new Object[]{s, finished});
+            }
+            for (Object[] e : earlier) { try { ((Socket) e[0]).close(); } catch (Exception ignored) {} }
+            for (Object[] e : earlier) {
+                try { ((java.util.concurrent.CountDownLatch) e[1]).await(30, java.util.concurrent.TimeUnit.SECONDS); }
+                catch (InterruptedException ignored) {}
             }
             String code = TrustStore.verifyCode(TlsIdentity.certificate(context), nonce);
             int decision = TrustStore.isTrustedSender(context, senderId, token) ? DECISION_ACCEPT
@@ -382,6 +400,17 @@ public class ReceiverServer {
                 listener.onLog("انقطع الاستلام؛ الجزء المستلم محفوظ ويكمل عند إعادة الإرسال");
         } finally {
             if (keyHex != null) v6Sessions.remove(keyHex);
+            if (claimed != null) {
+                ((java.util.concurrent.CountDownLatch) claimed[2]).countDown();
+                synchronized (batchAttempts) {
+                    List<Object[]> list = batchAttempts.get((String) claimed[0]);
+                    if (list != null) {
+                        java.util.Iterator<Object[]> it = list.iterator();
+                        while (it.hasNext()) if (it.next()[0] == s) it.remove();
+                        if (list.isEmpty()) batchAttempts.remove((String) claimed[0]);
+                    }
+                }
+            }
             if (started) listener.onSessionEnded(session, completed, cancelled.contains(s));
         }
     }

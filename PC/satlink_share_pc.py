@@ -404,6 +404,7 @@ class ReceiverServer:
         # confirmation got lost is told "already complete" instead of sending a duplicate.
         self.recent = {}; self.recent_lock = threading.Lock()
         self.sessions = {}; self.sessions_lock = threading.Lock()
+        self.batches = {}  # (sender id, batch) -> [(socket, finished event)] of earlier attempts
         # decide(request) -> 0 reject / 1 accept / 2 accept and trust. None = accept everything.
         self.decide = None
     # compatibility with older callers
@@ -597,6 +598,25 @@ class ReceiverServer:
             relative = safe_relative_path(read_utf(s)); size = read_long(s)
             if size < 0: raise ValueError("حجم الملف غير صالح")
             manifest.append((relative, size))
+        # A retry of the same batch: close the abandoned attempt and let it finish writing
+        # before resume offsets are computed, otherwise both could write the same file.
+        claim = (sender_id, batch); finished = threading.Event()
+        with self.sessions_lock:
+            earlier = list(self.batches.get(claim, [])); self.batches.setdefault(claim, []).append((s, finished))
+        for old_sock, _ in earlier:
+            try: old_sock.shutdown(socket.SHUT_RDWR)
+            except OSError: pass
+        for _, old_done in earlier: old_done.wait(30)
+        try:
+            self._handle_v6_body(s, cert_der, sender_name, sender_id, nonce, token, batch, count, total_bytes, manifest)
+        finally:
+            finished.set()
+            with self.sessions_lock:
+                attempts = [a for a in self.batches.get(claim, []) if a[0] is not s]
+                if attempts: self.batches[claim] = attempts
+                else: self.batches.pop(claim, None)
+
+    def _handle_v6_body(self, s, cert_der, sender_name, sender_id, nonce, token, batch, count, total_bytes, manifest):
         code = verify_code(cert_der, nonce)
         with _trust_lock: trusted = load_trust()["trusted"].get(sender_id)
         is_trusted = bool(trusted and token and hmac_equal(trusted.get("token", ""), token))
