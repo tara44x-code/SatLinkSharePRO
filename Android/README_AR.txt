@@ -1,4 +1,4 @@
-SatLink Share PRO Android 3.0 — المطور: مهند سات لنك
+SatLink Share PRO Android 4.0 — المطور: مهند سات لنك
 
 افتح README.md في جذر المشروع للتعليمات الكاملة.
 البناء: Android Studio مع JDK 17 و SDK 35، أو: ./gradlew assembleDebug

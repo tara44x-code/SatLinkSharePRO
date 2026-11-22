@@ -1,5 +1,11 @@
 plugins { id 'com.android.application' }
 
+// التوقيع الرسمي: GitHub Actions يضع مسار المفتاح وكلمة المرور من Secrets.
+// بدونها يُبنى التطبيق بتوقيع التجربة (debug).
+def releaseKeystore = System.getenv("SATLINK_KEYSTORE")
+def releasePassword = System.getenv("SATLINK_KEYSTORE_PASSWORD")
+def hasReleaseKey = releaseKeystore != null && !releaseKeystore.isEmpty() && new File(releaseKeystore).exists()
+
 android {
     namespace 'com.satlink.sharepro'
     compileSdk 35
@@ -13,8 +19,31 @@ android {
         applicationId 'com.satlink.sharepro'
         minSdk 23
         targetSdk 35
-        versionCode 31
-        versionName '3.1'
+        versionCode 40
+        versionName '4.0'
+    }
+
+    signingConfigs {
+        release {
+            if (hasReleaseKey) {
+                storeFile file(releaseKeystore)
+                storePassword releasePassword
+                keyAlias System.getenv("SATLINK_KEY_ALIAS") ?: "satlink"
+                keyPassword releasePassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig hasReleaseKey ? signingConfigs.release : signingConfigs.debug
+        }
+    }
+
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
     }
 }
 

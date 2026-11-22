@@ -1,4 +1,4 @@
-SatLink Share PRO PC 4.1 / Android 3.1
+SatLink Share PRO PC 5.0 / Android 4.0
 TCP port: 8988
 UDP discovery port: 8989
 Protocol header: SATLINK_SHARE_PRO_V3_RESUME
@@ -22,3 +22,19 @@ If the receiver already saved the same file (same sender, name, size) in the las
 the confirmation was lost, it answers resume = size followed by the confirmation, so no duplicate is made.
 Senders try V5 first and fall back to V3/V4 if an older receiver closes the connection.
 Senders reconnect up to 10 times and resume from the last byte.
+
+V6 (Android 4.0 / PC 5.0) — encrypted, approved, streamed.
+Main connection: plain UTF "SATLINK_SHARE_PRO_V6_SECURE", then TLS (receiver = server, self-signed cert).
+ S->R: UTF name, UTF deviceId, blob nonce(16) [int len + bytes], UTF trustToken (or ""), UTF batchId,
+       int count, long total, count x (UTF relativePath, long size)
+ Both show code = (first 4 bytes of SHA-256(receiverCertDER || nonce) as uint32) % 10000, 4 digits.
+ R->S: byte decision 0 reject / 1 accept / 2 accept+trust (then UTF newToken), blob sessionKey(16, empty if rejected),
+       then count x long resumeOffset.
+ S->R per file (in any order): int index, byte mode.
+   mode 0: bytes from offset to size inline.
+   mode 1: int streams; data comes over `streams` range connections.
+ R->S after each file is saved: int index, long size. S ends with int -1, R answers int -1.
+Range connection: plain UTF "SATLINK_SHARE_PRO_V6_RANGE", TLS (cert must match the main one),
+ S->R: blob sessionKey, int index, long start, long length, raw bytes; R->S: long written.
+Trust: receiver stores token per sender deviceId; sender stores token per receiver cert fingerprint and
+ only sends it to that fingerprint. Senders fall back V6 -> V5 -> V3/V4 when the receiver closes the connection.

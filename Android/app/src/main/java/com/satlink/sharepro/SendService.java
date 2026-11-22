@@ -83,7 +83,7 @@ public class SendService extends Service implements SenderClient.Listener {
         locks = new TransferLocks(this, "send");
         notifications = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (Build.VERSION.SDK_INT >= 26 && notifications != null) {
-            NotificationChannel channel = new NotificationChannel(CHANNEL, "إرسال SatLink", NotificationManager.IMPORTANCE_LOW);
+            NotificationChannel channel = new NotificationChannel(CHANNEL, L.t("إرسال SatLink", "SatLink sending"), NotificationManager.IMPORTANCE_LOW);
             channel.setDescription("تقدم إرسال الملفات");
             notifications.createNotificationChannel(channel);
         }
@@ -99,6 +99,7 @@ public class SendService extends Service implements SenderClient.Listener {
             return START_NOT_STICKY;
         }
         Job job;
+        client.parallel = getSharedPreferences("satlink_share_pro", MODE_PRIVATE).getBoolean("parallel", true);
         while ((job = queue.poll()) != null) {
             running.incrementAndGet();
             locks.acquire();
@@ -130,9 +131,11 @@ public class SendService extends Service implements SenderClient.Listener {
 
     @Override public void onBatchQueued(String batch, DeviceInfo target, List<FileItem> files) {
         batchPeer = target.name;
-        for (FileItem f : files)
+        for (FileItem f : files) {
             TransferLog.start(this, TransferLog.SEND, batch, f.name, target.name, f.size, TransferLog.STATE_CONNECTING);
-        update("جاري الاتصال بـ " + target.name, 0);
+            TransferLog.setSource(this, TransferLog.SEND, batch, f.name, f.uri == null ? null : f.uri.toString(), target.hostIp, target.port);
+        }
+        update(L.t("جاري الاتصال بـ ", "Connecting to ") + target.name, 0);
     }
 
     @Override public void onVerifyCode(String batch, String code) {
@@ -149,7 +152,7 @@ public class SendService extends Service implements SenderClient.Listener {
     @Override public void onProgress(String batch, String name, long done, long size, long speed) {
         TransferLog.progress(this, TransferLog.SEND, batch, name, done, size, speed);
         int p = size > 0 ? (int) Math.min(100, done * 100L / size) : 0;
-        update("إرسال: " + name + " · " + p + "% · " + NetworkUtils.formatSpeed(speed), p);
+        update(L.t("إرسال: ", "Sending: ") + name + " · " + p + "% · " + NetworkUtils.formatSpeed(speed), p);
     }
 
     @Override public void onFileFinished(String batch, String name) {
@@ -160,9 +163,9 @@ public class SendService extends Service implements SenderClient.Listener {
         boolean rejected = error != null && error.contains("رفض");
         TransferLog.endSession(this, TransferLog.SEND, batch,
                 cancelled ? TransferLog.STATE_CANCELLED : rejected ? TransferLog.STATE_REJECTED : TransferLog.STATE_FAILED);
-        String text = completed ? "اكتمل الإرسال إلى " + batchPeer
-                : cancelled ? "تم إلغاء الإرسال"
-                : "تعذر الإرسال" + (error == null ? "" : ": " + error) + " · أعد الإرسال ليكمل من آخر نقطة";
+        String text = completed ? L.t("اكتمل الإرسال إلى ", "Sent to ") + batchPeer
+                : cancelled ? L.t("تم إلغاء الإرسال", "Sending cancelled")
+                : (rejected ? L.t("رفض الجهاز الآخر الاستلام", "The receiver declined") : L.t("تعذر الإرسال", "Sending failed") + (error == null ? "" : ": " + error) + L.t(" · اضغط «أكمل» ليكمل من آخر نقطة", " · tap Resume to continue"));
         running.decrementAndGet();
         update(text, -1);
         showResult(text);
@@ -188,12 +191,12 @@ public class SendService extends Service implements SenderClient.Listener {
         PendingIntent cancelIntent = PendingIntent.getService(this, 4, cancel, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
         b.setSmallIcon(android.R.drawable.stat_sys_upload)
-                .setContentTitle("SatLink · إرسال الملفات")
-                .setContentText(status.isEmpty() ? "جاري التجهيز..." : status)
+                .setContentTitle(L.t("SatLink · إرسال الملفات", "SatLink · sending files"))
+                .setContentText(status.isEmpty() ? L.t("جاري التجهيز...", "Preparing...") : status)
                 .setContentIntent(openIntent)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
-                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "إلغاء", cancelIntent);
+                .addAction(android.R.drawable.ic_menu_close_clear_cancel, L.t("إلغاء", "Cancel"), cancelIntent);
         if (percent >= 0 && percent < 100) b.setProgress(100, percent, percent == 0);
         return b.build();
     }

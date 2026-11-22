@@ -214,7 +214,7 @@ public class ReceiveService extends Service implements ReceiverServer.Listener {
             receiver.start();
             nsd.registerService(NetworkUtils.PORT, NetworkUtils.getDeviceName(), null);
             udp.startAnnouncing(NetworkUtils.getDeviceName(), NetworkUtils.PORT, null);
-            update("الاستلام شغال", -1);
+            update(L.t("الاستلام شغال", "Receiving is on"), -1);
         }
         if (ACTION_VNET_ON.equals(action)) prefs(this).edit().putBoolean("vnet_enabled", true).apply();
         if (ACTION_VNET_OFF.equals(action)) prefs(this).edit().putBoolean("vnet_enabled", false).apply();
@@ -225,7 +225,7 @@ public class ReceiveService extends Service implements ReceiverServer.Listener {
     private void startVirtualNetwork() {
         if (vnetOn || vnet.isHosting()) return;
         vnetOn = true;
-        vnetMessage = "جاري تشغيل شبكة SatLink...";
+        vnetMessage = L.t("جاري تشغيل شبكة SatLink...", "Starting the SatLink network...");
         publishVnet();
         vnet.startHosting(NetworkUtils.getDeviceName(), new VirtualNetwork.Callback() {
             @Override public void onLog(String message) { }
@@ -276,7 +276,7 @@ public class ReceiveService extends Service implements ReceiverServer.Listener {
     @Override public void onSessionStarted(String session, String sender, int count, long totalBytes) {
         sessionPeers.put(session, sender);
         locks.acquire();
-        update("استلام " + count + " ملف من " + sender, 0);
+        update(L.t("استلام ", "Receiving ") + count + L.t(" ملف من ", " files from ") + sender, 0);
     }
 
     /** نفس الملف من نفس المرسل يبقى بنفس السطر حتى بعد الانقطاع والإكمال. */
@@ -293,7 +293,7 @@ public class ReceiveService extends Service implements ReceiverServer.Listener {
     @Override public void onProgress(String session, String name, long done, long size, long speed) {
         TransferLog.progress(this, TransferLog.RECEIVE, key(session), name, done, size, speed);
         int p = size > 0 ? (int) Math.min(100, done * 100L / size) : 0;
-        update("استلام: " + name + " · " + p + "% · " + NetworkUtils.formatSpeed(speed), p);
+        update(L.t("استلام: ", "Receiving: ") + name + " · " + p + "% · " + NetworkUtils.formatSpeed(speed), p);
     }
 
     @Override public void onFileSaved(String session, String name, long size, Uri uri) {
@@ -305,7 +305,7 @@ public class ReceiveService extends Service implements ReceiverServer.Listener {
         sessionPeers.remove(session);
         TransferLog.endSession(this, TransferLog.RECEIVE, key, cancelled ? TransferLog.STATE_CANCELLED : TransferLog.STATE_PAUSED);
         if (receiver.activeTransfers() == 0) locks.release();
-        update(completed ? "اكتمل الاستلام · الاستلام ما زال شغال" : cancelled ? "تم الإلغاء · الاستلام ما زال شغال" : "انقطع الاتصال؛ أعد الإرسال ليكمل من آخر نقطة", -1);
+        update(completed ? L.t("اكتمل الاستلام · الاستلام ما زال شغال", "Done · still receiving") : cancelled ? L.t("تم الإلغاء · الاستلام ما زال شغال", "Cancelled · still receiving") : L.t("انقطع الاتصال؛ يكمل من آخر نقطة عند إعادة الإرسال", "Connection lost; it resumes when sent again"), -1);
     }
 
     @Override public void onServerFailed(String message, Exception e) {
@@ -321,12 +321,12 @@ public class ReceiveService extends Service implements ReceiverServer.Listener {
         PendingIntent stopIntent = PendingIntent.getService(this, 2, stop, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
         b.setSmallIcon(android.R.drawable.stat_sys_download)
-                .setContentTitle("SatLink · الاستلام شغال")
+                .setContentTitle(L.t("SatLink · الاستلام شغال", "SatLink · receiving"))
                 .setContentText(status)
                 .setContentIntent(openIntent)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
-                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "إيقاف الاستلام", stopIntent);
+                .addAction(android.R.drawable.ic_menu_close_clear_cancel, L.t("إيقاف الاستلام", "Stop"), stopIntent);
         if (percent >= 0 && percent < 100) b.setProgress(100, percent, false);
         return b.build();
     }

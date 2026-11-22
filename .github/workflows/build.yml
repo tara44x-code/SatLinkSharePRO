@@ -21,6 +21,9 @@ jobs:
   android:
     name: Android APK
     runs-on: ubuntu-latest
+    env:
+      KEYSTORE_BASE64: ${{ secrets.SATLINK_KEYSTORE_BASE64 }}
+      SATLINK_KEYSTORE_PASSWORD: ${{ secrets.SATLINK_KEYSTORE_PASSWORD }}
     defaults:
       run:
         working-directory: Android
@@ -31,12 +34,23 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: gradle/actions/setup-gradle@v4
-      - name: Build debug APK
+      - name: Signing key (from GitHub Secrets)
+        if: env.KEYSTORE_BASE64 != ''
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/satlink-release.jks"
+          echo "SATLINK_KEYSTORE=$RUNNER_TEMP/satlink-release.jks" >> "$GITHUB_ENV"
+      - name: Build signed release APK
+        if: env.KEYSTORE_BASE64 != ''
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk "SatLink-Share-PRO.apk"
+      - name: Build debug APK (no signing key yet)
+        if: env.KEYSTORE_BASE64 == ''
         run: |
           chmod +x gradlew
           ./gradlew --no-daemon assembleDebug
-      - name: Rename APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk "SatLink-Share-PRO.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "SatLink-Share-PRO.apk"
       - uses: actions/upload-artifact@v4
         with:
           name: SatLink-Share-PRO-Android

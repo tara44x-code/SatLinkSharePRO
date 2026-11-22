@@ -44,6 +44,11 @@ public final class TransferLog {
         public String state;
         public String uri;
         public final long time;
+        public long endTime;
+        /** للإرسال: رابط الملف الأصلي وعنوان الجهاز، حتى يمكن الإكمال بضغطة. */
+        public String source;
+        public String targetIp;
+        public int targetPort;
 
         Entry(String id, String direction, String name, String peer, long size, long time) {
             this.id = id; this.direction = direction; this.name = name; this.peer = peer;
@@ -127,6 +132,7 @@ public final class TransferLog {
         e.speed = 0;
         if (STATE_DONE.equals(state)) e.done = e.size;
         if (uri != null) e.uri = uri;
+        e.endTime = System.currentTimeMillis();
         save(context, true);
         notify(e, false);
     }
@@ -136,10 +142,24 @@ public final class TransferLog {
         String prefix = direction + "|" + session + "|";
         for (Entry e : entries.values()) {
             if (e.id.startsWith(prefix) && e.isActive()) {
-                e.state = state; e.speed = 0;
+                e.state = state; e.speed = 0; e.endTime = System.currentTimeMillis();
                 notify(e, false);
             }
         }
+        save(context, true);
+    }
+
+    public static synchronized void setSource(Context context, String direction, String session, String name, String source, String ip, int port) {
+        Entry e = entries.get(direction + "|" + session + "|" + name);
+        if (e == null) return;
+        e.source = source; e.targetIp = ip; e.targetPort = port;
+        save(context, true);
+    }
+
+    public static synchronized Entry get(String id) { return entries.get(id); }
+
+    public static synchronized void remove(Context context, String id) {
+        entries.remove(id);
         save(context, true);
     }
 
@@ -153,7 +173,8 @@ public final class TransferLog {
 
     private static void archive(String id, Entry old) {
         Entry copy = new Entry(id + "#" + old.time, old.direction, old.name, old.peer, old.size, old.time);
-        copy.done = old.done; copy.state = old.state; copy.uri = old.uri;
+        copy.done = old.done; copy.state = old.state; copy.uri = old.uri; copy.endTime = old.endTime;
+        copy.source = old.source; copy.targetIp = old.targetIp; copy.targetPort = old.targetPort;
         LinkedHashMap<String, Entry> rebuilt = new LinkedHashMap<>();
         for (java.util.Map.Entry<String, Entry> m : entries.entrySet()) {
             if (m.getKey().equals(id)) rebuilt.put(copy.id, copy); else rebuilt.put(m.getKey(), m.getValue());
@@ -188,6 +209,10 @@ public final class TransferLog {
                 // أي نقل كان شغالاً عند إغلاق التطبيق صار متوقفاً؛ إعادة الإرسال تكمل من نفس النقطة.
                 if (e.isActive()) e.state = STATE_PAUSED;
                 e.uri = o.optString("uri", null);
+                e.endTime = o.optLong("end");
+                e.source = o.optString("src", null);
+                e.targetIp = o.optString("ip", null);
+                e.targetPort = (int) o.optLong("port");
                 entries.put(e.id, e);
             }
         } catch (Exception ignored) {}
@@ -204,6 +229,9 @@ public final class TransferLog {
                 o.put("id", e.id); o.put("dir", e.direction); o.put("name", e.name); o.put("peer", e.peer);
                 o.put("size", e.size); o.put("done", e.done); o.put("state", e.state); o.put("time", e.time);
                 if (e.uri != null) o.put("uri", e.uri);
+                if (e.endTime > 0) o.put("end", e.endTime);
+                if (e.source != null) o.put("src", e.source);
+                if (e.targetIp != null) { o.put("ip", e.targetIp); o.put("port", (long) e.targetPort); }
                 arr.put(o);
             }
             context.getApplicationContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE)

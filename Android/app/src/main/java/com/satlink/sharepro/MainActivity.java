@@ -21,14 +21,19 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.DocumentsContract;
+import android.provider.MediaStore;
+import android.text.Editable;
 import android.text.TextUtils;
+import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
@@ -37,31 +42,36 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 
 /**
- * SatLink Share PRO — واجهة بسيطة: الرئيسية فيها زر إرسال وزر استلام فقط.
+ * SatLink Share PRO — الرئيسية فيها إرسال واستلام فقط، والإعدادات من زر ⚙.
  * المطور: مهند سات لنك
  */
 public class MainActivity extends Activity implements TransferLog.Listener, ReceiveService.UiListener, SendService.UiListener {
     public static final String EXTRA_SCREEN = "com.satlink.sharepro.SCREEN";
-    private static final String DEVELOPER = "مهند سات لنك";
+    private static final String DEVELOPER_AR = "مهند سات لنك";
+    private static final String DEVELOPER_EN = "Muhannad SatLink";
     private static final int REQ_PICK_FILES = 3001;
     private static final int REQ_PICK_FOLDER = 3002;
+    private static final int REQ_PICK_MEDIA = 3003;
     private static final int REQ_PERMISSIONS = 4401;
 
-    private static final int BG = Color.rgb(4, 5, 10);
-    private static final int CARD_FILL = Color.argb(215, 10, 12, 22);
-    private static final int TEXT = Color.WHITE;
-    private static final int MUTED = Color.rgb(165, 172, 200);
-    private static final int CYAN = Color.rgb(0, 220, 255);
-    private static final int PINK = Color.rgb(255, 80, 200);
-    private static final int GREEN = Color.rgb(80, 255, 140);
-    private static final int RED = Color.rgb(255, 90, 110);
+    private static final int CYAN = Color.rgb(0, 200, 240);
+    private static final int GREEN = Color.rgb(40, 210, 110);
+    private static final int RED = Color.rgb(255, 80, 100);
+    private static final int AMBER = Color.rgb(245, 180, 0);
+
+    // ألوان حسب الثيم
+    private int BG, CARD_FILL, TEXT, MUTED;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private String screen = "home";
@@ -71,6 +81,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
     private final ArrayList<FileItem> selectedFiles = new ArrayList<>();
     private final ArrayList<DeviceInfo> lanDevices = new ArrayList<>();
     private final ArrayList<VirtualNetwork.Target> p2pTargets = new ArrayList<>();
+    private final HashSet<String> multiSelected = new HashSet<>();
     private SatLinkNsdHelper nsdHelper;
     private UdpDiscoveryHelper udpHelper;
     private VirtualNetwork vnet;
@@ -80,6 +91,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
     private TextView scanText;
     private TextView sendStatusText;
     private View cancelSendButton;
+    private TextView multiSendButton;
 
     // الاستلام
     private TextView receiveStatusText;
@@ -91,16 +103,18 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
     // قائمة الملفات
     private LinearLayout historyBox;
     private String historyDirection;
+    private String historyFilter = "";
     private final HashMap<String, RowViews> rows = new HashMap<>();
 
     private static final class RowViews {
-        TextView title; TextView sub; ProgressBar bar;
+        TextView title, sub, meta, action; ProgressBar bar;
     }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         L.init(this);
+        applyThemeColors();
         nsdHelper = new SatLinkNsdHelper(this);
         udpHelper = new UdpDiscoveryHelper(this);
         vnet = new VirtualNetwork(this);
@@ -108,6 +122,22 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         requestNeededPermissions();
         if (!handleIntent(getIntent())) showHome();
     }
+
+    private void applyThemeColors() {
+        if (L.light()) {
+            BG = Color.rgb(238, 241, 248);
+            CARD_FILL = Color.argb(235, 255, 255, 255);
+            TEXT = Color.rgb(20, 22, 35);
+            MUTED = Color.rgb(95, 102, 130);
+        } else {
+            BG = Color.rgb(4, 5, 10);
+            CARD_FILL = Color.argb(215, 10, 12, 22);
+            TEXT = Color.WHITE;
+            MUTED = Color.rgb(165, 172, 200);
+        }
+    }
+
+    private String developer() { return L.english() ? DEVELOPER_EN : DEVELOPER_AR; }
 
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
@@ -139,7 +169,9 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
     }
 
     @Override public void onBackPressed() {
-        if (!"home".equals(screen)) showHome(); else super.onBackPressed();
+        if ("apps".equals(screen)) showSend();
+        else if (!"home".equals(screen)) showHome();
+        else super.onBackPressed();
     }
 
     private boolean handleIntent(Intent intent) {
@@ -167,7 +199,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         selectedFiles.clear();
         for (Uri uri : uris) if (uri != null) addUri(uri);
         showSend();
-        if (!selectedFiles.isEmpty()) toast("اختر الجهاز المستلم");
+        if (!selectedFiles.isEmpty()) toast(L.t("اختر الجهاز المستلم", "Choose the receiving device"));
         return true;
     }
 
@@ -176,6 +208,8 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         w.setStatusBarColor(BG);
         w.setNavigationBarColor(BG);
         w.getDecorView().setBackgroundColor(BG);
+        if (Build.VERSION.SDK_INT >= 23)
+            w.getDecorView().setSystemUiVisibility(L.light() ? View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR : 0);
     }
 
     private void requestNeededPermissions() {
@@ -196,29 +230,27 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        // بعد منح صلاحية الأجهزة القريبة نعيد تشغيل البحث/الشبكة حتى تشتغل فوراً.
         if ("send".equals(screen)) startSearch();
         if ("receive".equals(screen)) ReceiveService.start(this, null);
     }
 
-    // =================================================================== الشاشات
+    // =================================================================== الهيكل
 
-    /** هيكل كل شاشة: خلفية نيون + محتوى قابل للتمرير. */
     private void frame(boolean scroll) {
         rows.clear();
-        historyBox = null;
-        historyDirection = null;
-        devicesBox = null; scanText = null; selectionText = null; sendStatusText = null; cancelSendButton = null;
+        historyBox = null; historyDirection = null;
+        devicesBox = null; scanText = null; selectionText = null; sendStatusText = null; cancelSendButton = null; multiSendButton = null;
         receiveStatusText = null; addressesText = null; vnetText = null; vnetSwitch = null;
 
         FrameLayout rootFrame = new FrameLayout(this);
-        rootFrame.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);
+        rootFrame.setLayoutDirection(L.english() ? View.LAYOUT_DIRECTION_LTR : View.LAYOUT_DIRECTION_RTL);
         rootFrame.setBackgroundColor(BG);
-        ImageView bg = new ImageView(this);
-        bg.setImageResource(R.drawable.bg_neon);
-        bg.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        rootFrame.addView(bg, new FrameLayout.LayoutParams(-1, -1));
-
+        if (!L.light()) {
+            ImageView bg = new ImageView(this);
+            bg.setImageResource(R.drawable.bg_neon);
+            bg.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            rootFrame.addView(bg, new FrameLayout.LayoutParams(-1, -1));
+        }
         content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         content.setPadding(dp(16), dp(14), dp(16), dp(24));
@@ -239,28 +271,36 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         stopSearch();
         frame(false);
 
-        content.addView(space(28));
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        content.addView(top, lp(-1, dp(48)));
+        top.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
+        TextView settings = text("⚙", 26, TEXT, false);
+        settings.setGravity(Gravity.CENTER);
+        settings.setContentDescription(L.t("الإعدادات", "Settings"));
+        settings.setOnClickListener(v -> showSettings());
+        top.addView(settings, lp(dp(48), dp(48)));
+
         TextView title = text("SatLink Share PRO", 26, TEXT, true);
         title.setGravity(Gravity.CENTER);
-        title.setShadowLayer(dp(10), 0, 0, Color.rgb(120, 80, 255));
+        if (!L.light()) title.setShadowLayer(dp(10), 0, 0, Color.rgb(120, 80, 255));
         content.addView(title, lp(-1, -2));
-        TextView dev = text("المطور: " + DEVELOPER, 14, CYAN, true);
+        TextView dev = text(L.t("المطور: ", "Developer: ") + developer(), 14, CYAN, true);
         dev.setGravity(Gravity.CENTER);
-        dev.setShadowLayer(dp(6), 0, 0, CYAN);
         content.addView(dev, lp(-1, -2));
 
         LinearLayout middle = new LinearLayout(this);
         middle.setOrientation(LinearLayout.VERTICAL);
         middle.setGravity(Gravity.CENTER);
         content.addView(middle, new LinearLayout.LayoutParams(-1, 0, 1));
-
-        middle.addView(cardButton(R.drawable.card_send, "إرسال", v -> showSend()), lp(-1, -2));
+        middle.addView(cardButton(L.english() ? R.drawable.card_send_en : R.drawable.card_send, L.t("إرسال", "Send"), v -> showSend()), lp(-1, -2));
         middle.addView(space(18));
-        middle.addView(cardButton(R.drawable.card_receive, "استلام", v -> showReceive()), lp(-1, -2));
+        middle.addView(cardButton(L.english() ? R.drawable.card_receive_en : R.drawable.card_receive, L.t("استلام", "Receive"), v -> showReceive()), lp(-1, -2));
 
-        String bgState = (ReceiveService.isActive() ? "الاستلام شغال بالخلفية" : "")
-                + (SendService.isBusy() ? (ReceiveService.isActive() ? "  ·  " : "") + "الإرسال شغال بالخلفية" : "");
-        TextView foot = text(bgState.isEmpty() ? "بالراوتر أو بدون راوتر · سريع · بدون إنترنت" : bgState, 13, MUTED, false);
+        String state = (ReceiveService.isActive() ? L.t("الاستلام شغال بالخلفية", "Receiving in background") : "")
+                + (SendService.isBusy() ? (ReceiveService.isActive() ? "  ·  " : "") + L.t("الإرسال شغال بالخلفية", "Sending in background") : "");
+        TextView foot = text(state.isEmpty() ? L.t("بالراوتر أو بدون راوتر · مشفر · بدون إنترنت", "With or without a router · encrypted · offline") : state, 13, MUTED, false);
         foot.setGravity(Gravity.CENTER);
         content.addView(foot, lp(-1, -2));
     }
@@ -281,54 +321,62 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER_VERTICAL);
         content.addView(bar, lp(-1, dp(64)));
-
-        TextView back = text("›", 38, TEXT, true); // في الاتجاه العربي السهم لليمين يعني رجوع
+        TextView back = text(L.english() ? "‹" : "›", 38, TEXT, true);
         back.setGravity(Gravity.CENTER);
-        back.setOnClickListener(v -> showHome());
+        back.setContentDescription(L.t("رجوع", "Back"));
+        back.setOnClickListener(v -> onBackPressed());
         bar.addView(back, lp(dp(44), -1));
-
-        ImageView icon = new ImageView(this);
-        icon.setImageResource(iconRes);
-        icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        bar.addView(icon, lp(dp(64), dp(56)));
-
+        if (iconRes != 0) {
+            ImageView icon = new ImageView(this);
+            icon.setImageResource(iconRes);
+            icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            bar.addView(icon, lp(dp(64), dp(56)));
+        }
         LinearLayout titles = new LinearLayout(this);
         titles.setOrientation(LinearLayout.VERTICAL);
         titles.setGravity(Gravity.CENTER_VERTICAL);
         bar.addView(titles, new LinearLayout.LayoutParams(0, -1, 1));
         TextView t = text(title, 24, TEXT, true);
-        t.setShadowLayer(dp(8), 0, 0, Color.rgb(140, 90, 255));
+        if (!L.light()) t.setShadowLayer(dp(8), 0, 0, Color.rgb(140, 90, 255));
         titles.addView(t, lp(-1, -2));
-        titles.addView(text("المطور: " + DEVELOPER, 12, CYAN, false), lp(-1, -2));
+        titles.addView(text(L.t("المطور: ", "Developer: ") + developer(), 12, CYAN, false), lp(-1, -2));
         content.addView(space(10));
     }
 
-    // ------------------------------------------------------------------- الإرسال
+    // =================================================================== الإرسال
 
     private void showSend() {
         screen = "send";
         frame(true);
-        header("إرسال", R.drawable.ic_send_neon);
+        header(L.t("إرسال", "Send"), R.drawable.ic_send_neon);
 
-        LinearLayout pickRow = new LinearLayout(this);
-        pickRow.setOrientation(LinearLayout.HORIZONTAL);
-        pickRow.addView(neonButton("اختيار ملفات", NeonDrawable.COOL, v -> openFilePicker()), weight());
-        pickRow.addView(neonButton("اختيار مجلد", NeonDrawable.WARM, v -> openFolderPicker()), weight());
-        content.addView(pickRow, lp(-1, dp(58)));
+        // تبويبات: ملفات، صور، فيديو، تطبيقات، ألعاب، مجلد
+        HorizontalScrollView hs = new HorizontalScrollView(this);
+        hs.setHorizontalScrollBarEnabled(false);
+        LinearLayout tabs = new LinearLayout(this);
+        tabs.setOrientation(LinearLayout.HORIZONTAL);
+        hs.addView(tabs);
+        tabs.addView(tab("📄 " + L.t("ملفات", "Files"), NeonDrawable.COOL, v -> openFilePicker()), tabLp());
+        tabs.addView(tab("🖼 " + L.t("صور", "Photos"), NeonDrawable.WARM, v -> openMediaPicker("image/*")), tabLp());
+        tabs.addView(tab("🎬 " + L.t("فيديو", "Videos"), NeonDrawable.RAINBOW, v -> openMediaPicker("video/*")), tabLp());
+        tabs.addView(tab("📦 " + L.t("تطبيقات", "Apps"), NeonDrawable.COOL, v -> showApps(false)), tabLp());
+        tabs.addView(tab("🎮 " + L.t("ألعاب", "Games"), NeonDrawable.WARM, v -> showApps(true)), tabLp());
+        tabs.addView(tab("📁 " + L.t("مجلد", "Folder"), NeonDrawable.RAINBOW, v -> openFolderPicker()), tabLp());
+        content.addView(hs, lp(-1, dp(52)));
         content.addView(space(8));
 
         selectionText = text("", 14, MUTED, false);
         selectionText.setPadding(dp(6), 0, dp(6), 0);
         selectionText.setOnClickListener(v -> {
-            if (!selectedFiles.isEmpty()) { selectedFiles.clear(); updateSelection(); toast("تم مسح الاختيار"); }
+            if (!selectedFiles.isEmpty()) { selectedFiles.clear(); updateSelection(); toast(L.t("تم مسح الاختيار", "Selection cleared")); }
         });
         content.addView(selectionText, lp(-1, -2));
         updateSelection();
         content.addView(space(14));
 
-        LinearLayout devHead = sectionHeader("الأجهزة القريبة");
-        devHead.addView(smallButton("IP يدوي", v -> showManualIpDialog()), lp(-2, dp(36)));
-        devHead.addView(smallButton("↻ بحث", v -> startSearch()), lp(-2, dp(36)));
+        LinearLayout devHead = sectionHeader(L.t("الأجهزة القريبة", "Nearby devices"));
+        devHead.addView(smallButton(L.t("IP يدوي", "Manual IP"), v -> showManualIpDialog()), lp(-2, dp(36)));
+        devHead.addView(smallButton("↻ " + L.t("بحث", "Scan"), v -> startSearch()), lp(-2, dp(36)));
         content.addView(devHead, lp(-1, -2));
         scanText = text("", 13, MUTED, false);
         content.addView(scanText, lp(-1, -2));
@@ -336,19 +384,24 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         devicesBox = new LinearLayout(this);
         devicesBox.setOrientation(LinearLayout.VERTICAL);
         content.addView(devicesBox, lp(-1, -2));
+        multiSendButton = (TextView) neonButton("", NeonDrawable.RAINBOW, v -> sendToSelected());
+        multiSendButton.setVisibility(View.GONE);
+        content.addView(multiSendButton, lp(-1, dp(54)));
         renderDevices();
         content.addView(space(14));
 
-        LinearLayout histHead = sectionHeader("الملفات المرسلة");
-        TextView cancel = smallButton("إلغاء", v -> { SendService.cancel(); toast("تم طلب الإلغاء"); });
+        LinearLayout histHead = sectionHeader(L.t("الملفات المرسلة", "Sent files"));
+        TextView cancel = smallButton(L.t("إلغاء", "Cancel"), v -> { SendService.cancel(); toast(L.t("تم طلب الإلغاء", "Cancelling")); });
         cancel.setTextColor(RED);
         cancelSendButton = cancel;
         cancel.setVisibility(SendService.isBusy() ? View.VISIBLE : View.GONE);
         histHead.addView(cancel, lp(-2, dp(36)));
-        histHead.addView(smallButton("مسح", v -> { TransferLog.clear(this, TransferLog.SEND); renderHistory(); }), lp(-2, dp(36)));
+        histHead.addView(smallButton(L.t("أكمل الكل", "Resume all"), v -> resumeAll()), lp(-2, dp(36)));
+        histHead.addView(smallButton(L.t("مسح", "Clear"), v -> { TransferLog.clear(this, TransferLog.SEND); renderHistory(); }), lp(-2, dp(36)));
         content.addView(histHead, lp(-1, -2));
         sendStatusText = text("", 13, MUTED, false);
         content.addView(sendStatusText, lp(-1, -2));
+        addSearchBox();
         historyBox = new LinearLayout(this);
         historyBox.setOrientation(LinearLayout.VERTICAL);
         content.addView(historyBox, lp(-1, -2));
@@ -358,18 +411,35 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         startSearch();
     }
 
+    private View tab(String label, int[] colors, View.OnClickListener click) {
+        TextView b = text(label, 14, TEXT, true);
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(16), 0, dp(16), 0);
+        b.setBackground(new NeonDrawable(colors, density(), CARD_FILL, 8));
+        b.setOnClickListener(click);
+        pressable(b);
+        return b;
+    }
+
+    private LinearLayout.LayoutParams tabLp() {
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-2, -1);
+        p.setMargins(dp(3), 0, dp(3), 0);
+        return p;
+    }
+
     private void updateSelection() {
         if (selectionText == null) return;
         if (selectedFiles.isEmpty()) {
-            selectionText.setText("اختر الملفات، ثم اضغط على الجهاز المستلم وسيبدأ الإرسال مباشرة");
+            selectionText.setText(L.t("اختر ملفات أو صور أو تطبيقات، ثم اضغط على الجهاز المستلم وسيبدأ الإرسال",
+                    "Pick files, photos or apps, then tap the receiving device to start"));
             selectionText.setTextColor(MUTED);
             return;
         }
         long total = 0;
         for (FileItem f : selectedFiles) total += Math.max(0, f.size);
         String first = selectedFiles.get(0).name;
-        String text = selectedFiles.size() == 1 ? first : selectedFiles.size() + " ملف";
-        selectionText.setText("✓ " + text + " · " + NetworkUtils.formatBytes(total) + "   (اضغط هنا للمسح)");
+        String what = selectedFiles.size() == 1 ? first : selectedFiles.size() + L.t(" ملف", " files");
+        selectionText.setText("✓ " + what + " · " + NetworkUtils.formatBytes(total) + L.t("   (اضغط هنا للمسح)", "   (tap to clear)"));
         selectionText.setTextColor(GREEN);
     }
 
@@ -379,8 +449,9 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         searching = true;
         lanDevices.clear();
         p2pTargets.clear();
+        multiSelected.clear();
         renderDevices();
-        setScan("جاري البحث على الراوتر وعلى شبكة SatLink...");
+        setScan(L.t("جاري البحث على الراوتر وعلى شبكة SatLink...", "Searching the router and the SatLink network..."));
         nsdHelper.startDiscovery(new SatLinkNsdHelper.DiscoveryCallback() {
             @Override public void onDeviceFound(DeviceInfo d) { addLan(d); }
             @Override public void onDiscoveryLog(String m) { }
@@ -395,7 +466,8 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         });
         ui.postDelayed(() -> {
             if (searching && lanDevices.isEmpty() && p2pTargets.isEmpty())
-                setScan("لم يظهر جهاز بعد. افتح «استلام» في الجهاز الثاني، أو استخدم IP يدوي.");
+                setScan(L.t("لم يظهر جهاز بعد. افتح «استلام» في الجهاز الثاني، أو استخدم IP يدوي.",
+                        "No device yet. Open “Receive” on the other device, or use Manual IP."));
         }, 12000);
     }
 
@@ -435,7 +507,13 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         devicesBox.removeAllViews();
         int shown = 0;
         for (DeviceInfo d : lanDevices) {
-            devicesBox.addView(deviceRow(d.name, "عبر الراوتر · " + d.hostIp, NeonDrawable.COOL, v -> sendTo(d)), lp(-1, dp(72)));
+            boolean selected = multiSelected.contains(d.key());
+            View row = deviceRow(d.name, (selected ? "✓ " : "") + L.t("عبر الراوتر · ", "via router · ") + d.hostIp,
+                    selected ? NeonDrawable.RAINBOW : NeonDrawable.COOL, v -> {
+                        if (!multiSelected.isEmpty()) toggleMulti(d); else sendTo(d);
+                    });
+            row.setOnLongClickListener(v -> { toggleMulti(d); return true; });
+            devicesBox.addView(row, lp(-1, dp(72)));
             devicesBox.addView(space(8));
             shown++;
         }
@@ -443,19 +521,30 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
             boolean dup = false;
             for (DeviceInfo d : lanDevices) if (cleanName(d.name).equals(cleanName(t.name))) { dup = true; break; }
             if (dup) continue;
-            devicesBox.addView(deviceRow(t.name, "بدون راوتر · شبكة SatLink", NeonDrawable.WARM, v -> sendViaVirtualNetwork(t)), lp(-1, dp(72)));
+            devicesBox.addView(deviceRow(t.name, L.t("بدون راوتر · شبكة SatLink", "no router · SatLink network"), NeonDrawable.WARM, v -> sendViaVirtualNetwork(t)), lp(-1, dp(72)));
             devicesBox.addView(space(8));
             shown++;
         }
         if (shown == 0) {
-            TextView empty = text("لا توجد أجهزة بعد…\nافتح «استلام» في الهاتف أو الحاسبة الثانية.", 14, MUTED, false);
+            TextView empty = text(L.t("لا توجد أجهزة بعد…\nافتح «استلام» في الهاتف أو الحاسبة الثانية.", "No devices yet…\nOpen “Receive” on the other phone or PC."), 14, MUTED, false);
             empty.setGravity(Gravity.CENTER);
             empty.setPadding(dp(12), dp(16), dp(12), dp(16));
             empty.setBackground(new NeonDrawable(NeonDrawable.COOL, density(), CARD_FILL));
             devicesBox.addView(empty, lp(-1, -2));
         } else {
-            setScan("اضغط على الجهاز ليبدأ الإرسال");
+            setScan(lanDevices.size() > 1
+                    ? L.t("اضغط على الجهاز ليبدأ الإرسال · ضغطة مطولة لاختيار أكثر من جهاز", "Tap a device to send · long-press to pick several")
+                    : L.t("اضغط على الجهاز ليبدأ الإرسال", "Tap a device to send"));
         }
+        if (multiSendButton != null) {
+            multiSendButton.setVisibility(multiSelected.isEmpty() ? View.GONE : View.VISIBLE);
+            multiSendButton.setText(L.t("إرسال للأجهزة المحددة (", "Send to selected (") + multiSelected.size() + ")");
+        }
+    }
+
+    private void toggleMulti(DeviceInfo d) {
+        if (!multiSelected.remove(d.key())) multiSelected.add(d.key());
+        renderDevices();
     }
 
     private View deviceRow(String name, String sub, int[] colors, View.OnClickListener click) {
@@ -463,8 +552,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         box.setOrientation(LinearLayout.HORIZONTAL);
         box.setGravity(Gravity.CENTER_VERTICAL);
         box.setPadding(dp(16), dp(6), dp(16), dp(6));
-        NeonDrawable bg = new NeonDrawable(colors, density(), CARD_FILL);
-        box.setBackground(bg);
+        box.setBackground(new NeonDrawable(colors, density(), CARD_FILL));
         TextView icon = text(name.toLowerCase(Locale.US).contains("pc") ? "🖥" : "📱", 24, TEXT, false);
         icon.setGravity(Gravity.CENTER);
         box.addView(icon, lp(dp(42), -1));
@@ -476,7 +564,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         n.setSingleLine(true); n.setEllipsize(TextUtils.TruncateAt.END);
         texts.addView(n, lp(-1, -2));
         texts.addView(text(sub, 12, MUTED, false), lp(-1, -2));
-        TextView go = text("إرسال ‹", 14, CYAN, true);
+        TextView go = text(L.t("إرسال ‹", "Send ›"), 14, CYAN, true);
         go.setGravity(Gravity.CENTER);
         box.addView(go, lp(-2, -1));
         box.setOnClickListener(click);
@@ -485,7 +573,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
     }
 
     private boolean ensureFiles() {
-        if (selectedFiles.isEmpty()) { toast("اختر ملفات أولاً"); openFilePicker(); return false; }
+        if (selectedFiles.isEmpty()) { toast(L.t("اختر ملفات أولاً", "Pick files first")); openFilePicker(); return false; }
         return true;
     }
 
@@ -494,7 +582,18 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         SendService.send(this, d, selectedFiles);
         selectedFiles.clear();
         updateSelection();
-        toast("بدأ الإرسال إلى " + d.name);
+        toast(L.t("بدأ الإرسال إلى ", "Sending to ") + d.name);
+    }
+
+    private void sendToSelected() {
+        if (!ensureFiles()) return;
+        int n = 0;
+        for (DeviceInfo d : lanDevices) if (multiSelected.contains(d.key())) { SendService.send(this, d, selectedFiles); n++; }
+        selectedFiles.clear();
+        multiSelected.clear();
+        updateSelection();
+        renderDevices();
+        toast(L.t("بدأ الإرسال إلى ", "Sending to ") + n + L.t(" أجهزة", " devices"));
     }
 
     private void sendViaVirtualNetwork(VirtualNetwork.Target t) {
@@ -502,9 +601,9 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         final ArrayList<FileItem> files = new ArrayList<>(selectedFiles);
         selectedFiles.clear();
         updateSelection();
-        ReceiveService.pauseVirtualNetwork(); // الهاتف لا يقدر يكون مستلماً ومرسلاً على شبكتين مباشرتين بنفس الوقت
+        ReceiveService.pauseVirtualNetwork();
         stopSearch();
-        setScan("جاري الاتصال بشبكة " + t.name + " ...");
+        setScan(L.t("جاري الاتصال بشبكة ", "Connecting to ") + t.name + " ...");
         final boolean[] done = {false};
         vnet.connect(t, new VirtualNetwork.Callback() {
             @Override public void onLog(String m) { setScan(m); }
@@ -512,25 +611,25 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
                 if (done[0]) return;
                 done[0] = true;
                 if (ownerIp == null || iAmOwner) {
-                    setScan("تم الاتصال. اضغط بحث واختر الجهاز من القائمة");
+                    setScan(L.t("تم الاتصال. اضغط بحث واختر الجهاز من القائمة", "Connected. Tap Scan and pick the device"));
                     selectedFiles.addAll(files); updateSelection();
                     startSearch();
                     return;
                 }
-                setScan("متصل بدون راوتر · بدأ الإرسال");
+                setScan(L.t("متصل بدون راوتر · بدأ الإرسال", "Connected without router · sending"));
                 SendService.send(MainActivity.this, new DeviceInfo(t.name, ownerIp, t.port), files);
             }
             @Override public void onDisconnected() {
                 if (done[0]) return;
                 done[0] = true;
-                setScan("تعذر الاتصال بشبكة SatLink. قرّب الجهازين وحاول مجدداً");
+                setScan(L.t("تعذر الاتصال بشبكة SatLink. قرّب الجهازين وحاول مجدداً", "Could not join the SatLink network. Move closer and retry"));
                 selectedFiles.addAll(files); updateSelection();
             }
         });
         ui.postDelayed(() -> {
             if (!done[0]) {
                 done[0] = true;
-                setScan("انتهت مهلة الاتصال. تأكد أن الاستلام مفتوح بالجهاز الثاني وحاول مجدداً");
+                setScan(L.t("انتهت مهلة الاتصال. تأكد أن الاستلام مفتوح بالجهاز الثاني", "Timed out. Make sure Receive is open on the other device"));
                 selectedFiles.addAll(files); updateSelection();
             }
         }, 30000);
@@ -540,17 +639,17 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         final EditText input = new EditText(this);
         input.setSingleLine(true);
         input.setInputType(android.text.InputType.TYPE_CLASS_PHONE);
-        input.setHint("مثال: 192.168.1.20");
+        input.setHint("192.168.1.20");
         AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle("عنوان IP للجهاز المستلم")
-                .setMessage("العنوان ظاهر في شاشة الاستلام بالجهاز الثاني.")
+                .setTitle(L.t("عنوان IP للجهاز المستلم", "Receiver IP address"))
+                .setMessage(L.t("العنوان ظاهر في شاشة الاستلام بالجهاز الثاني.", "It is shown on the Receive screen of the other device."))
                 .setView(input)
-                .setPositiveButton("إضافة", null)
-                .setNegativeButton("إلغاء", null)
+                .setPositiveButton(L.t("إضافة", "Add"), null)
+                .setNegativeButton(L.t("إلغاء", "Cancel"), null)
                 .create();
         dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             String ip = input.getText().toString().trim();
-            if (!isIpv4(ip)) { toast("اكتب عنوان IPv4 صحيح"); return; }
+            if (!isIpv4(ip)) { toast(L.t("اكتب عنوان IPv4 صحيح", "Enter a valid IPv4 address")); return; }
             addLan(new DeviceInfo("SatLink · " + ip, ip, NetworkUtils.PORT));
             dialog.dismiss();
         }));
@@ -563,7 +662,245 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         return true;
     }
 
-    // ------------------------------------------------------------------- الموافقة ورمز التحقق
+    // ---------------------------------------------------------------- الإكمال بضغطة
+
+    private boolean resumable(TransferLog.Entry e) {
+        return TransferLog.SEND.equals(e.direction) && !e.isActive() && !TransferLog.STATE_DONE.equals(e.state)
+                && e.source != null && e.targetIp != null && e.targetPort > 0;
+    }
+
+    private void resumeEntries(List<TransferLog.Entry> list) {
+        LinkedHashMap<String, ArrayList<FileItem>> byTarget = new LinkedHashMap<>();
+        LinkedHashMap<String, DeviceInfo> targets = new LinkedHashMap<>();
+        for (TransferLog.Entry e : list) {
+            if (!resumable(e)) continue;
+            String key = e.targetIp + ":" + e.targetPort;
+            targets.put(key, new DeviceInfo(e.peer, e.targetIp, e.targetPort));
+            ArrayList<FileItem> files = byTarget.get(key);
+            if (files == null) { files = new ArrayList<>(); byTarget.put(key, files); }
+            files.add(new FileItem(Uri.parse(e.source), e.name, e.size));
+            TransferLog.remove(this, e.id);
+        }
+        if (byTarget.isEmpty()) { toast(L.t("لا توجد ملفات متوقفة", "Nothing to resume")); return; }
+        for (String key : byTarget.keySet()) SendService.send(this, targets.get(key), byTarget.get(key));
+        toast(L.t("جاري الإكمال من آخر نقطة", "Resuming from where it stopped"));
+        renderHistory();
+    }
+
+    private void resumeAll() {
+        resumeEntries(TransferLog.list(this, TransferLog.SEND));
+    }
+
+    @Override public void onSendStatus(String status, boolean busy) {
+        if (codeDialog != null && codeDialog.isShowing() && status != null && !status.contains(L.t("رمز التحقق", "Verification code"))) {
+            try { codeDialog.dismiss(); } catch (Exception ignored) {}
+        }
+        if (sendStatusText != null) sendStatusText.setText(status == null ? "" : status);
+        if (cancelSendButton != null) cancelSendButton.setVisibility(busy ? View.VISIBLE : View.GONE);
+    }
+
+    // ---------------------------------------------------------------- التطبيقات والألعاب
+
+    private void showApps(boolean games) {
+        screen = "apps";
+        stopSearch();
+        frame(true);
+        header(games ? L.t("ألعاب", "Games") : L.t("تطبيقات", "Apps"), 0);
+        TextView hint = text(L.t("جاري تحميل القائمة…", "Loading…"), 14, MUTED, false);
+        content.addView(hint, lp(-1, -2));
+        final LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        content.addView(list, lp(-1, -2));
+        final ArrayList<AppsCatalog.App> chosen = new ArrayList<>();
+        final TextView done = (TextView) neonButton(L.t("إضافة للإرسال", "Add to send"), NeonDrawable.RAINBOW, v -> {
+            for (AppsCatalog.App a : chosen) selectedFiles.addAll(AppsCatalog.toFiles(a));
+            showSend();
+            if (!chosen.isEmpty()) toast(L.t("اضغط على الجهاز المستلم", "Tap the receiving device"));
+        });
+        new Thread(() -> {
+            List<AppsCatalog.App> apps = AppsCatalog.load(this);
+            ui.post(() -> {
+                if (!"apps".equals(screen)) return;
+                int count = 0;
+                for (AppsCatalog.App a : apps) {
+                    if (games && !a.game) continue;
+                    count++;
+                    LinearLayout row = new LinearLayout(this);
+                    row.setOrientation(LinearLayout.HORIZONTAL);
+                    row.setGravity(Gravity.CENTER_VERTICAL);
+                    row.setPadding(dp(12), dp(6), dp(12), dp(6));
+                    row.setBackground(new NeonDrawable(NeonDrawable.COOL, density(), CARD_FILL, 8));
+                    ImageView icon = new ImageView(this);
+                    icon.setImageDrawable(a.icon);
+                    row.addView(icon, lp(dp(40), dp(40)));
+                    LinearLayout texts = new LinearLayout(this);
+                    texts.setOrientation(LinearLayout.VERTICAL);
+                    texts.setPadding(dp(10), 0, dp(10), 0);
+                    row.addView(texts, new LinearLayout.LayoutParams(0, -2, 1));
+                    TextView name = text(a.label, 15, TEXT, true);
+                    name.setSingleLine(true); name.setEllipsize(TextUtils.TruncateAt.END);
+                    texts.addView(name, lp(-1, -2));
+                    texts.addView(text(NetworkUtils.formatBytes(a.size) + (a.splits != null && a.splits.length > 0 ? L.t(" · مقسّم", " · split APK") : ""), 12, MUTED, false), lp(-1, -2));
+                    CheckBox cb = new CheckBox(this);
+                    row.addView(cb, lp(-2, -2));
+                    cb.setOnCheckedChangeListener((b, c) -> {
+                        if (c) chosen.add(a); else chosen.remove(a);
+                        done.setText(L.t("إضافة للإرسال (", "Add to send (") + chosen.size() + ")");
+                    });
+                    row.setOnClickListener(v -> cb.setChecked(!cb.isChecked()));
+                    list.addView(row, lp(-1, dp(62)));
+                    list.addView(space(6));
+                }
+                hint.setText(count == 0 ? L.t("لا توجد عناصر", "Nothing found")
+                        : L.t("اختر ثم اضغط «إضافة للإرسال». التطبيقات المقسّمة تُرسل كمجلد للتثبيت ببرنامج مثل SAI.",
+                        "Select, then tap “Add to send”. Split apps are sent as a folder (install with an app like SAI)."));
+                content.addView(space(8));
+                content.addView(done, lp(-1, dp(56)));
+            });
+        }, "satlink-apps").start();
+    }
+
+    // =================================================================== الاستلام
+
+    private void showReceive() {
+        screen = "receive";
+        stopSearch();
+        frame(true);
+        header(L.t("استلام", "Receive"), R.drawable.ic_receive_neon);
+        ReceiveService.start(this, null);
+
+        LinearLayout status = new LinearLayout(this);
+        status.setOrientation(LinearLayout.VERTICAL);
+        status.setPadding(dp(18), dp(14), dp(18), dp(14));
+        status.setBackground(new NeonDrawable(NeonDrawable.RAINBOW, density(), CARD_FILL));
+        TextView on = text("● " + L.t("الاستلام شغال", "Receiving is on"), 20, GREEN, true);
+        status.addView(on, lp(-1, -2));
+        status.addView(text(NetworkUtils.getDeviceName(), 15, TEXT, true), lp(-1, -2));
+        addressesText = text("", 13, MUTED, false);
+        status.addView(addressesText, lp(-1, -2));
+        receiveStatusText = text("", 13, CYAN, false);
+        status.addView(receiveStatusText, lp(-1, -2));
+        TextView ask = text(ReceiveService.askBeforeReceiving(this)
+                ? L.t("🔒 مشفر · يسألك قبل الاستلام من جهاز جديد", "🔒 Encrypted · asks before accepting a new device")
+                : L.t("🔒 مشفر · يقبل كل الأجهزة (غيّرها من الإعدادات)", "🔒 Encrypted · accepts every device (change in Settings)"), 12, MUTED, false);
+        status.addView(ask, lp(-1, -2));
+        content.addView(status, lp(-1, -2));
+        refreshAddresses();
+        content.addView(space(12));
+
+        LinearLayout vbox = new LinearLayout(this);
+        vbox.setOrientation(LinearLayout.VERTICAL);
+        vbox.setPadding(dp(18), dp(10), dp(18), dp(12));
+        vbox.setBackground(new NeonDrawable(NeonDrawable.WARM, density(), CARD_FILL));
+        vnetSwitch = new Switch(this);
+        vnetSwitch.setText(L.t("بدون راوتر · شبكة SatLink", "No router · SatLink network"));
+        vnetSwitch.setTextColor(TEXT);
+        vnetSwitch.setTextSize(16);
+        vnetSwitch.setTypeface(Typeface.DEFAULT_BOLD);
+        vnetSwitch.setChecked(ReceiveService.virtualNetworkWanted(this));
+        vnetSwitch.setOnCheckedChangeListener((b, checked) -> {
+            if (updatingSwitch) return;
+            ReceiveService.start(this, checked ? ReceiveService.ACTION_VNET_ON : ReceiveService.ACTION_VNET_OFF);
+        });
+        vbox.addView(vnetSwitch, lp(-1, dp(44)));
+        vnetText = text("", 13, MUTED, false);
+        vnetText.setOnClickListener(v -> copyPassword());
+        vbox.addView(vnetText, lp(-1, -2));
+        content.addView(vbox, lp(-1, -2));
+        content.addView(space(10));
+
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        actions.addView(neonButton(L.t("فتح المجلد", "Open folder"), NeonDrawable.COOL, v -> openReceivedFolder()), weight());
+        actions.addView(neonButton(L.t("إيقاف الاستلام", "Stop receiving"), NeonDrawable.DANGER, v -> {
+            ReceiveService.start(this, ReceiveService.ACTION_STOP);
+            toast(L.t("تم إيقاف الاستلام", "Receiving stopped"));
+            showHome();
+        }), weight());
+        content.addView(actions, lp(-1, dp(54)));
+        content.addView(space(14));
+
+        LinearLayout histHead = sectionHeader(L.t("الملفات المستلمة", "Received files"));
+        TextView cancel = smallButton(L.t("إلغاء الجاري", "Cancel current"), v -> { ReceiveService.cancelCurrent(); toast(L.t("تم إلغاء النقل الجاري", "Cancelled")); });
+        cancel.setTextColor(RED);
+        histHead.addView(cancel, lp(-2, dp(36)));
+        histHead.addView(smallButton(L.t("مسح", "Clear"), v -> { TransferLog.clear(this, TransferLog.RECEIVE); renderHistory(); }), lp(-2, dp(36)));
+        content.addView(histHead, lp(-1, -2));
+        addSearchBox();
+        historyBox = new LinearLayout(this);
+        historyBox.setOrientation(LinearLayout.VERTICAL);
+        content.addView(historyBox, lp(-1, -2));
+        historyDirection = TransferLog.RECEIVE;
+        renderHistory();
+        ReceiveService.attach(this);
+    }
+
+    private void refreshAddresses() {
+        if (addressesText == null) return;
+        StringBuilder sb = new StringBuilder();
+        for (String[] a : NetworkUtils.listAddresses()) {
+            if (sb.length() > 0) sb.append('\n');
+            String type = L.english() ? (a[0].equals("الراوتر") ? "Router" : a[0].equals("شبكة SatLink") ? "SatLink network" : a[0]) : a[0];
+            sb.append(type).append(": ").append(a[1]);
+        }
+        addressesText.setText(sb.length() == 0 ? L.t("غير متصل بشبكة · شغّل «بدون راوتر» بالأسفل", "Not connected · turn on “No router” below") : sb.toString());
+    }
+
+    private String vnetSsid = "", vnetPass = "";
+
+    @Override public void onReceiveStatus(String status) {
+        if (receiveStatusText != null) receiveStatusText.setText(status);
+    }
+
+    @Override public void onVirtualNetwork(boolean on, String ssid, String passphrase, String ip, String message) {
+        vnetSsid = ssid == null ? "" : ssid;
+        vnetPass = passphrase == null ? "" : passphrase;
+        if (vnetSwitch != null) {
+            updatingSwitch = true;
+            vnetSwitch.setChecked(on || ReceiveService.virtualNetworkWanted(this) && (message != null && message.startsWith("جاري")));
+            updatingSwitch = false;
+        }
+        if (vnetText == null) return;
+        if (on && !vnetSsid.isEmpty()) {
+            vnetText.setText(L.t("الهواتف تكتشفك تلقائياً بدون راوتر.\nللحاسبة: اتصل من الواي فاي بالشبكة\nالاسم: ", "Phones find you automatically without a router.\nFor a PC: join this Wi‑Fi network\nName: ")
+                    + vnetSsid + L.t("\nكلمة المرور: ", "\nPassword: ") + vnetPass + L.t("   (اضغط للنسخ)", "   (tap to copy)"));
+            vnetText.setTextColor(TEXT);
+        } else if (on) {
+            vnetText.setText(message == null ? L.t("جاري التشغيل...", "Starting...") : message);
+            vnetText.setTextColor(MUTED);
+        } else {
+            vnetText.setText(message == null || message.isEmpty() || "متوقفة".equals(message)
+                    ? L.t("متوقفة · الاستلام يعمل عبر الراوتر فقط", "Off · receiving over the router only") : message);
+            vnetText.setTextColor(MUTED);
+        }
+        refreshAddresses();
+    }
+
+    private void copyPassword() {
+        if (vnetPass.isEmpty()) return;
+        ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("SatLink", vnetPass));
+        toast(L.t("تم نسخ كلمة المرور", "Password copied"));
+    }
+
+    private void openReceivedFolder() {
+        try {
+            Uri uri = DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", "primary:Download/SatLink Share PRO/Received");
+            Intent intent = new Intent(Intent.ACTION_VIEW);
+            intent.setDataAndType(uri, "vnd.android.document/directory");
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(intent);
+            return;
+        } catch (Exception ignored) {}
+        try {
+            startActivity(new Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS));
+            toast(L.t("افتح مجلد SatLink Share PRO ثم Received", "Open SatLink Share PRO, then Received"));
+        } catch (Exception e) {
+            toast("Downloads/SatLink Share PRO/Received");
+        }
+    }
+
+    // ---------------------------------------------------------------- الموافقة ورمز التحقق
 
     private AlertDialog requestDialog;
     private String requestDialogId;
@@ -608,170 +945,139 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         codeDialog.show();
     }
 
-    @Override public void onSendStatus(String status, boolean busy) {
-        if (codeDialog != null && codeDialog.isShowing() && status != null && !status.contains(L.t("رمز التحقق", "Verification code"))) {
-            try { codeDialog.dismiss(); } catch (Exception ignored) {}
-        }
-        if (sendStatusText != null) sendStatusText.setText(status == null ? "" : status);
-        if (cancelSendButton != null) cancelSendButton.setVisibility(busy ? View.VISIBLE : View.GONE);
-    }
+    // =================================================================== الإعدادات
 
-    // ------------------------------------------------------------------- الاستلام
-
-    private void showReceive() {
-        screen = "receive";
+    private void showSettings() {
+        screen = "settings";
         stopSearch();
         frame(true);
-        header("استلام", R.drawable.ic_receive_neon);
-        ReceiveService.start(this, null);
+        header(L.t("الإعدادات", "Settings"), 0);
 
-        LinearLayout status = new LinearLayout(this);
-        status.setOrientation(LinearLayout.VERTICAL);
-        status.setPadding(dp(18), dp(14), dp(18), dp(14));
-        status.setBackground(new NeonDrawable(NeonDrawable.RAINBOW, density(), CARD_FILL));
-        TextView on = text("● الاستلام شغال", 20, GREEN, true);
-        on.setShadowLayer(dp(6), 0, 0, GREEN);
-        status.addView(on, lp(-1, -2));
-        status.addView(text(NetworkUtils.getDeviceName(), 15, TEXT, true), lp(-1, -2));
-        addressesText = text("", 13, MUTED, false);
-        status.addView(addressesText, lp(-1, -2));
-        receiveStatusText = text("", 13, CYAN, false);
-        status.addView(receiveStatusText, lp(-1, -2));
-        content.addView(status, lp(-1, -2));
-        refreshAddresses();
-        content.addView(space(12));
+        content.addView(sectionHeader(L.t("المظهر", "Appearance")), lp(-1, -2));
+        LinearLayout lang = new LinearLayout(this);
+        lang.setOrientation(LinearLayout.HORIZONTAL);
+        lang.addView(choice("العربية", !L.english(), v -> { L.setEnglish(this, false); restartUi(); }), weight());
+        lang.addView(choice("English", L.english(), v -> { L.setEnglish(this, true); restartUi(); }), weight());
+        content.addView(lang, lp(-1, dp(50)));
+        content.addView(space(8));
+        LinearLayout theme = new LinearLayout(this);
+        theme.setOrientation(LinearLayout.HORIZONTAL);
+        theme.addView(choice("🌙 " + L.t("داكن", "Dark"), !L.light(), v -> { L.setLight(this, false); restartUi(); }), weight());
+        theme.addView(choice("☀ " + L.t("فاتح", "Light"), L.light(), v -> { L.setLight(this, true); restartUi(); }), weight());
+        content.addView(theme, lp(-1, dp(50)));
+        content.addView(space(16));
 
-        LinearLayout vbox = new LinearLayout(this);
-        vbox.setOrientation(LinearLayout.VERTICAL);
-        vbox.setPadding(dp(18), dp(10), dp(18), dp(12));
-        vbox.setBackground(new NeonDrawable(NeonDrawable.WARM, density(), CARD_FILL));
-        vnetSwitch = new Switch(this);
-        vnetSwitch.setText("بدون راوتر · شبكة SatLink");
-        vnetSwitch.setTextColor(TEXT);
-        vnetSwitch.setTextSize(16);
-        vnetSwitch.setTypeface(Typeface.DEFAULT_BOLD);
-        vnetSwitch.setChecked(ReceiveService.virtualNetworkWanted(this));
-        vnetSwitch.setOnCheckedChangeListener((b, checked) -> {
-            if (updatingSwitch) return;
-            ReceiveService.start(this, checked ? ReceiveService.ACTION_VNET_ON : ReceiveService.ACTION_VNET_OFF);
+        content.addView(sectionHeader(L.t("الأمان والنقل", "Security & transfer")), lp(-1, -2));
+        content.addView(settingSwitch(L.t("اسأل قبل الاستلام من جهاز جديد", "Ask before receiving from a new device"),
+                ReceiveService.askBeforeReceiving(this), c -> ReceiveService.setAskBeforeReceiving(this, c)), lp(-1, -2));
+        android.content.SharedPreferences prefs = getSharedPreferences("satlink_share_pro", MODE_PRIVATE);
+        content.addView(settingSwitch(L.t("تسريع الملفات الكبيرة (عدة اتصالات)", "Speed up large files (several connections)"),
+                prefs.getBoolean("parallel", true), c -> prefs.edit().putBoolean("parallel", c).apply()), lp(-1, -2));
+        content.addView(space(16));
+
+        content.addView(sectionHeader(L.t("الأجهزة الموثوقة", "Trusted devices")), lp(-1, -2));
+        List<String[]> trusted = TrustStore.trustedSenders(this);
+        if (trusted.isEmpty()) {
+            content.addView(text(L.t("لا يوجد. اضغط «قبول دائماً» عند الاستلام حتى يُضاف الجهاز هنا.",
+                    "None yet. Tap “Always accept” when receiving to add a device."), 13, MUTED, false), lp(-1, -2));
+        }
+        for (String[] t : trusted) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(14), 0, dp(10), 0);
+            row.setBackground(new NeonDrawable(NeonDrawable.COOL, density(), CARD_FILL, 8));
+            TextView n = text("✓ " + t[1], 15, TEXT, true);
+            row.addView(n, new LinearLayout.LayoutParams(0, -2, 1));
+            TextView rm = smallButton(L.t("حذف", "Remove"), v -> { TrustStore.forgetSender(this, t[0]); showSettings(); });
+            rm.setTextColor(RED);
+            row.addView(rm, lp(-2, dp(40)));
+            content.addView(row, lp(-1, dp(54)));
+            content.addView(space(6));
+        }
+        content.addView(space(16));
+
+        content.addView(sectionHeader(L.t("حول التطبيق", "About")), lp(-1, -2));
+        String version = "";
+        try { version = getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception ignored) {}
+        content.addView(text("SatLink Share PRO " + version + "\n" + L.t("المطور: ", "Developer: ") + developer()
+                + "\n" + L.t("نقل مشفر بين الهاتف والحاسبة، بالراوتر أو بدونه.", "Encrypted transfers between phones and PCs, with or without a router."), 14, MUTED, false), lp(-1, -2));
+    }
+
+    private interface BoolSetter { void set(boolean value); }
+
+    private View settingSwitch(String label, boolean value, BoolSetter setter) {
+        Switch sw = new Switch(this);
+        sw.setText(label);
+        sw.setTextColor(TEXT);
+        sw.setTextSize(15);
+        sw.setChecked(value);
+        sw.setPadding(dp(14), dp(10), dp(14), dp(10));
+        sw.setBackground(new NeonDrawable(NeonDrawable.COOL, density(), CARD_FILL, 8));
+        sw.setOnCheckedChangeListener((b, c) -> setter.set(c));
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.VERTICAL);
+        wrap.addView(sw, lp(-1, -2));
+        wrap.addView(space(6));
+        return wrap;
+    }
+
+    private View choice(String label, boolean selected, View.OnClickListener click) {
+        TextView b = text(label, 15, selected ? TEXT : MUTED, selected);
+        b.setGravity(Gravity.CENTER);
+        b.setBackground(new NeonDrawable(selected ? NeonDrawable.RAINBOW : new int[]{Color.rgb(90, 95, 120)}, density(), CARD_FILL, 8));
+        b.setOnClickListener(click);
+        return b;
+    }
+
+    private void restartUi() {
+        applyThemeColors();
+        configureWindow();
+        showSettings();
+    }
+
+    // =================================================================== قائمة الملفات
+
+    private void addSearchBox() {
+        EditText search = new EditText(this);
+        search.setSingleLine(true);
+        search.setHint("🔍 " + L.t("بحث بالاسم أو الجهاز", "Search by name or device"));
+        search.setTextColor(TEXT);
+        search.setHintTextColor(MUTED);
+        search.setTextSize(14);
+        search.setPadding(dp(14), dp(8), dp(14), dp(8));
+        search.setBackground(new NeonDrawable(new int[]{Color.rgb(90, 95, 140)}, density(), CARD_FILL, 6));
+        search.setText(historyFilter);
+        search.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void afterTextChanged(Editable s) { historyFilter = s.toString().trim(); renderHistory(); }
         });
-        vbox.addView(vnetSwitch, lp(-1, dp(44)));
-        vnetText = text("", 13, MUTED, false);
-        vnetText.setOnClickListener(v -> copyPassword());
-        vbox.addView(vnetText, lp(-1, -2));
-        content.addView(vbox, lp(-1, -2));
-        content.addView(space(10));
-
-        LinearLayout actions = new LinearLayout(this);
-        actions.setOrientation(LinearLayout.HORIZONTAL);
-        actions.addView(neonButton("فتح المجلد", NeonDrawable.COOL, v -> openReceivedFolder()), weight());
-        View stop = neonButton("إيقاف الاستلام", NeonDrawable.DANGER, v -> {
-            ReceiveService.start(this, ReceiveService.ACTION_STOP);
-            toast("تم إيقاف الاستلام");
-            showHome();
-        });
-        actions.addView(stop, weight());
-        content.addView(actions, lp(-1, dp(54)));
-        content.addView(space(14));
-
-        LinearLayout histHead = sectionHeader("الملفات المستلمة");
-        TextView cancel = smallButton("إلغاء الجاري", v -> { ReceiveService.cancelCurrent(); toast("تم إلغاء النقل الجاري"); });
-        cancel.setTextColor(RED);
-        histHead.addView(cancel, lp(-2, dp(36)));
-        histHead.addView(smallButton("مسح", v -> { TransferLog.clear(this, TransferLog.RECEIVE); renderHistory(); }), lp(-2, dp(36)));
-        content.addView(histHead, lp(-1, -2));
-        historyBox = new LinearLayout(this);
-        historyBox.setOrientation(LinearLayout.VERTICAL);
-        content.addView(historyBox, lp(-1, -2));
-        historyDirection = TransferLog.RECEIVE;
-        renderHistory();
-        ReceiveService.attach(this);
+        content.addView(space(6));
+        content.addView(search, lp(-1, dp(46)));
+        content.addView(space(8));
     }
-
-    private void refreshAddresses() {
-        if (addressesText == null) return;
-        StringBuilder sb = new StringBuilder();
-        for (String[] a : NetworkUtils.listAddresses()) {
-            if (sb.length() > 0) sb.append('\n');
-            sb.append(a[0]).append(": ").append(a[1]);
-        }
-        addressesText.setText(sb.length() == 0 ? "غير متصل بشبكة · شغّل «بدون راوتر» بالأسفل" : sb.toString());
-    }
-
-    private String vnetSsid = "", vnetPass = "";
-
-    @Override public void onReceiveStatus(String status) {
-        if (receiveStatusText != null) receiveStatusText.setText(status);
-    }
-
-    @Override public void onVirtualNetwork(boolean on, String ssid, String passphrase, String ip, String message) {
-        vnetSsid = ssid == null ? "" : ssid;
-        vnetPass = passphrase == null ? "" : passphrase;
-        if (vnetSwitch != null) {
-            updatingSwitch = true;
-            vnetSwitch.setChecked(on || ReceiveService.virtualNetworkWanted(this) && (message != null && message.startsWith("جاري")));
-            updatingSwitch = false;
-        }
-        if (vnetText == null) return;
-        if (on && !vnetSsid.isEmpty()) {
-            vnetText.setText("الهواتف تكتشفك تلقائياً بدون راوتر.\nللحاسبة: اتصل من الواي فاي بالشبكة\nالاسم: " + vnetSsid
-                    + "\nكلمة المرور: " + vnetPass + "   (اضغط للنسخ)");
-            vnetText.setTextColor(TEXT);
-        } else if (on) {
-            vnetText.setText(message == null ? "جاري التشغيل..." : message);
-            vnetText.setTextColor(MUTED);
-        } else {
-            vnetText.setText(message == null || message.isEmpty() || "متوقفة".equals(message)
-                    ? "متوقفة · الاستلام يعمل عبر الراوتر فقط" : message);
-            vnetText.setTextColor(MUTED);
-        }
-        refreshAddresses();
-    }
-
-    private void copyPassword() {
-        if (vnetPass.isEmpty()) return;
-        ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-        if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("SatLink", vnetPass));
-        toast("تم نسخ كلمة المرور");
-    }
-
-    private void openReceivedFolder() {
-        try {
-            Uri uri = DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", "primary:Download/SatLink Share PRO/Received");
-            Intent intent = new Intent(Intent.ACTION_VIEW);
-            intent.setDataAndType(uri, "vnd.android.document/directory");
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            startActivity(intent);
-            return;
-        } catch (Exception ignored) {}
-        try {
-            Intent intent = new Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS);
-            startActivity(intent);
-            toast("افتح مجلد SatLink Share PRO ثم Received");
-        } catch (Exception e) {
-            toast("مكان الحفظ: Downloads/SatLink Share PRO/Received");
-        }
-    }
-
-    // ------------------------------------------------------------------- قائمة الملفات
 
     private void renderHistory() {
         if (historyBox == null || historyDirection == null) return;
         historyBox.removeAllViews();
         rows.clear();
         List<TransferLog.Entry> list = TransferLog.list(this, historyDirection);
-        if (list.isEmpty()) {
-            TextView empty = text(TransferLog.SEND.equals(historyDirection) ? "لم ترسل ملفات بعد" : "لم تستلم ملفات بعد", 14, MUTED, false);
+        String filter = historyFilter.toLowerCase(Locale.ROOT);
+        int count = 0;
+        for (TransferLog.Entry e : list) {
+            if (!filter.isEmpty() && !e.name.toLowerCase(Locale.ROOT).contains(filter)
+                    && (e.peer == null || !e.peer.toLowerCase(Locale.ROOT).contains(filter))) continue;
+            if (++count > 150) break;
+            historyBox.addView(historyRow(e), lp(-1, -2));
+            historyBox.addView(space(8));
+        }
+        if (count == 0) {
+            TextView empty = text(!filter.isEmpty() ? L.t("لا توجد نتائج", "No results")
+                    : TransferLog.SEND.equals(historyDirection) ? L.t("لم ترسل ملفات بعد", "Nothing sent yet") : L.t("لم تستلم ملفات بعد", "Nothing received yet"), 14, MUTED, false);
             empty.setGravity(Gravity.CENTER);
             empty.setPadding(dp(12), dp(18), dp(12), dp(18));
             historyBox.addView(empty, lp(-1, -2));
-            return;
-        }
-        int count = 0;
-        for (TransferLog.Entry e : list) {
-            if (++count > 120) break;
-            historyBox.addView(historyRow(e), lp(-1, -2));
-            historyBox.addView(space(8));
         }
     }
 
@@ -781,12 +1087,25 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         box.setPadding(dp(16), dp(10), dp(16), dp(12));
         box.setBackground(new NeonDrawable(TransferLog.SEND.equals(e.direction) ? NeonDrawable.COOL : NeonDrawable.WARM, density(), CARD_FILL, 10));
         RowViews r = new RowViews();
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
         r.title = text("", 15, TEXT, true);
         r.title.setSingleLine(true);
         r.title.setEllipsize(TextUtils.TruncateAt.MIDDLE);
-        box.addView(r.title, lp(-1, -2));
+        top.addView(r.title, new LinearLayout.LayoutParams(0, -2, 1));
+        r.action = smallButton(L.t("أكمل ↻", "Resume ↻"), v -> {
+            TransferLog.Entry current = TransferLog.get(e.id);
+            ArrayList<TransferLog.Entry> one = new ArrayList<>();
+            one.add(current == null ? e : current);
+            resumeEntries(one);
+        });
+        top.addView(r.action, lp(-2, dp(34)));
+        box.addView(top, lp(-1, -2));
         r.sub = text("", 12, MUTED, false);
         box.addView(r.sub, lp(-1, -2));
+        r.meta = text("", 11, MUTED, false);
+        box.addView(r.meta, lp(-1, -2));
         r.bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         r.bar.setMax(100);
         r.bar.setProgressDrawable(progressDrawable());
@@ -800,25 +1119,26 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
     }
 
     private void bindRow(RowViews r, TransferLog.Entry e) {
-        String icon;
+        String icon, state;
         int color;
-        String state;
         switch (e.state) {
-            case TransferLog.STATE_DONE: icon = "✓ "; color = GREEN; state = "مكتمل"; break;
-            case TransferLog.STATE_CANCELLED: icon = "✕ "; color = RED; state = "ملغي"; break;
-            case TransferLog.STATE_FAILED: icon = "! "; color = RED; state = "متوقف · أعد الإرسال ليكمل"; break;
-            case TransferLog.STATE_PAUSED: icon = "Ⅱ "; color = Color.rgb(255, 200, 0); state = "متوقف · يكمل عند إعادة الإرسال"; break;
-            case TransferLog.STATE_CONNECTING: icon = "… "; color = CYAN; state = "جاري الاتصال"; break;
-            default: icon = "↻ "; color = CYAN; state = "جاري"; break;
+            case TransferLog.STATE_DONE: icon = "✓ "; color = GREEN; state = L.t("مكتمل", "Done"); break;
+            case TransferLog.STATE_CANCELLED: icon = "✕ "; color = RED; state = L.t("ملغي", "Cancelled"); break;
+            case TransferLog.STATE_REJECTED: icon = "⛔ "; color = RED; state = L.t("رفضه المستلم", "Declined by receiver"); break;
+            case TransferLog.STATE_FAILED: icon = "! "; color = RED; state = L.t("متوقف", "Stopped"); break;
+            case TransferLog.STATE_PAUSED: icon = "Ⅱ "; color = AMBER; state = L.t("متوقف · يكمل عند إعادة الإرسال", "Paused · resumes when sent again"); break;
+            case TransferLog.STATE_CONNECTING: icon = "… "; color = CYAN; state = L.t("بانتظار الموافقة", "Waiting for approval"); break;
+            default: icon = "↻ "; color = CYAN; state = L.t("جاري", "In progress"); break;
         }
         r.title.setText(icon + e.name);
         StringBuilder sub = new StringBuilder();
-        if (e.peer != null && !e.peer.isEmpty()) sub.append(TransferLog.SEND.equals(e.direction) ? "إلى " : "من ").append(e.peer).append(" · ");
+        if (e.peer != null && !e.peer.isEmpty())
+            sub.append(TransferLog.SEND.equals(e.direction) ? L.t("إلى ", "to ") : L.t("من ", "from ")).append(e.peer).append(" · ");
         if (e.isActive()) {
             sub.append(e.percent()).append("% · ").append(NetworkUtils.formatBytes(e.done)).append(" / ").append(NetworkUtils.formatBytes(e.size));
             if (e.speed > 0) {
                 sub.append(" · ").append(NetworkUtils.formatSpeed(e.speed));
-                sub.append(" · متبقي ").append(eta((e.size - e.done) / Math.max(1, e.speed)));
+                sub.append(" · ").append(L.t("متبقي ", "left ")).append(eta((e.size - e.done) / Math.max(1, e.speed)));
             }
         } else {
             sub.append(state).append(" · ").append(NetworkUtils.formatBytes(e.size));
@@ -826,10 +1146,23 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         }
         r.sub.setText(sub.toString());
         r.sub.setTextColor(e.isActive() ? MUTED : color);
+        String when = new SimpleDateFormat("yyyy/MM/dd  HH:mm", Locale.US).format(new Date(e.time));
+        String meta = when;
+        if (TransferLog.STATE_DONE.equals(e.state) && e.endTime > e.time && e.size > 0) {
+            long ms = e.endTime - e.time;
+            meta += " · " + L.t("المدة ", "took ") + eta(Math.max(1, ms / 1000)) + " · " + L.t("السرعة ", "avg ") + NetworkUtils.formatSpeed(e.size * 1000 / Math.max(1, ms));
+        }
+        r.meta.setText(meta);
         r.bar.setProgress(e.percent());
+        r.action.setVisibility(resumable(e) ? View.VISIBLE : View.GONE);
     }
 
     private static String eta(long seconds) {
+        if (L.english()) {
+            if (seconds >= 3600) return (seconds / 3600) + "h " + ((seconds % 3600) / 60) + "m";
+            if (seconds >= 60) return (seconds / 60) + "m " + (seconds % 60) + "s";
+            return seconds + "s";
+        }
         if (seconds >= 3600) return (seconds / 3600) + "س " + ((seconds % 3600) / 60) + "د";
         if (seconds >= 60) return (seconds / 60) + "د " + (seconds % 60) + "ث";
         return seconds + "ث";
@@ -844,9 +1177,9 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
             Intent view = new Intent(Intent.ACTION_VIEW);
             view.setDataAndType(uri, type == null ? FileStoreUtils.guessMimeType(e.name) : type);
             view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            startActivity(Intent.createChooser(view, "فتح " + e.name));
+            startActivity(Intent.createChooser(view, e.name));
         } catch (Exception ex) {
-            toast("لا يوجد تطبيق يفتح هذا الملف");
+            toast(L.t("لا يوجد تطبيق يفتح هذا الملف", "No app can open this file"));
         }
     }
 
@@ -857,7 +1190,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         else bindRow(r, entry);
     }
 
-    // ------------------------------------------------------------------- اختيار الملفات
+    // =================================================================== اختيار الملفات
 
     private void openFilePicker() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -865,12 +1198,29 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
         try { startActivityForResult(intent, REQ_PICK_FILES); }
-        catch (Exception e) { toast("لا يوجد مدير ملفات على الجهاز"); }
+        catch (Exception e) { toast(L.t("لا يوجد مدير ملفات على الجهاز", "No file manager found")); }
+    }
+
+    /** الصور والفيديو: منتقي الصور الحديث (بدون صلاحيات)، أو منتقي الملفات في الأجهزة الأقدم. */
+    private void openMediaPicker(String type) {
+        Intent intent;
+        if (Build.VERSION.SDK_INT >= 33) {
+            intent = new Intent(MediaStore.ACTION_PICK_IMAGES);
+            intent.setType(type);
+            intent.putExtra(MediaStore.EXTRA_PICK_IMAGES_MAX, MediaStore.getPickImagesMaxLimit());
+        } else {
+            intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            intent.setType(type);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        }
+        try { startActivityForResult(intent, REQ_PICK_MEDIA); }
+        catch (Exception e) { openFilePicker(); }
     }
 
     private void openFolderPicker() {
         try { startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_PICK_FOLDER); }
-        catch (Exception e) { toast("اختيار المجلد غير مدعوم على هذا الجهاز"); }
+        catch (Exception e) { toast(L.t("اختيار المجلد غير مدعوم على هذا الجهاز", "Folder picking is not supported here")); }
     }
 
     private static class FolderNode {
@@ -895,7 +1245,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
             FolderNode folder = pending.removeFirst();
             Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, folder.id);
             try (Cursor c = getContentResolver().query(children, columns, null, null, null)) {
-                if (c == null) throw new java.io.IOException("تعذر قراءة محتويات المجلد");
+                if (c == null) throw new java.io.IOException(L.t("تعذر قراءة محتويات المجلد", "Could not read the folder"));
                 while (c.moveToNext()) {
                     String id = c.getString(0), name = c.getString(1), mime = c.getString(2);
                     if (id == null || name == null) continue;
@@ -906,9 +1256,9 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
                         Uri fileUri = DocumentsContract.buildDocumentUriUsingTree(tree, id);
                         long size = c.isNull(3) ? -1 : c.getLong(3);
                         if (size < 0) size = FileStoreUtils.fromUri(this, fileUri).size;
-                        if (size < 0) throw new java.io.IOException("حجم غير معروف: " + relative);
+                        if (size < 0) throw new java.io.IOException("? " + relative);
                         result.add(new FileItem(fileUri, relative, size));
-                        if (result.size() > 10000) throw new java.io.IOException("المجلد يحتوي أكثر من 10000 ملف");
+                        if (result.size() > 50000) throw new java.io.IOException(L.t("المجلد كبير جداً", "Folder too large"));
                     }
                 }
             }
@@ -923,22 +1273,21 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         if (requestCode == REQ_PICK_FOLDER && data.getData() != null) {
             Uri tree = data.getData();
             try { getContentResolver().takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION); } catch (Exception ignored) {}
-            toast("جاري قراءة المجلد...");
+            toast(L.t("جاري قراءة المجلد...", "Reading folder..."));
             new Thread(() -> {
                 try {
                     ArrayList<FileItem> entries = listFolderFiles(tree);
                     ui.post(() -> {
-                        if (entries.isEmpty()) { toast("المجلد ما يحتوي ملفات"); return; }
-                        selectedFiles.clear();
+                        if (entries.isEmpty()) { toast(L.t("المجلد ما يحتوي ملفات", "The folder is empty")); return; }
                         selectedFiles.addAll(entries);
                         updateSelection();
                     });
-                } catch (Exception e) { ui.post(() -> toast("تعذر قراءة المجلد: " + e.getMessage())); }
+                } catch (Exception e) { ui.post(() -> toast(e.getMessage())); }
             }, "satlink-folder-scan").start();
             return;
         }
-        if (requestCode == REQ_PICK_FILES) {
-            selectedFiles.clear();
+        if (requestCode == REQ_PICK_FILES || requestCode == REQ_PICK_MEDIA) {
+            int before = selectedFiles.size();
             if (data.getClipData() != null) {
                 ClipData clip = data.getClipData();
                 for (int i = 0; i < clip.getItemCount(); i++) addUri(clip.getItemAt(i).getUri());
@@ -946,14 +1295,15 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
                 addUri(data.getData());
             }
             updateSelection();
-            if (!selectedFiles.isEmpty()) toast("اضغط على الجهاز المستلم");
+            if (selectedFiles.size() > before) toast(L.t("اضغط على الجهاز المستلم", "Tap the receiving device"));
         }
     }
 
     private void addUri(Uri uri) {
         try { getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION); } catch (Exception ignored) {}
         FileItem item = FileStoreUtils.fromUri(this, uri);
-        if (item.size < 0) { toast("تعذر معرفة حجم: " + item.name); return; }
+        if (item.size < 0) { toast("? " + item.name); return; }
+        for (FileItem f : selectedFiles) if (f.uri.equals(uri)) return;
         selectedFiles.add(item);
     }
 
@@ -964,7 +1314,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         TextView t = text(title, 18, TEXT, true);
-        t.setShadowLayer(dp(6), 0, 0, Color.rgb(120, 80, 255));
+        if (!L.light()) t.setShadowLayer(dp(6), 0, 0, Color.rgb(120, 80, 255));
         row.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
         return row;
     }
@@ -981,16 +1331,16 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
     private TextView smallButton(String label, View.OnClickListener click) {
         TextView b = text(label, 13, CYAN, true);
         b.setGravity(Gravity.CENTER);
-        b.setPadding(dp(12), 0, dp(12), 0);
+        b.setPadding(dp(10), 0, dp(10), 0);
         b.setOnClickListener(click);
         return b;
     }
 
     private Drawable progressDrawable() {
         GradientDrawable track = new GradientDrawable();
-        track.setColor(Color.argb(50, 255, 255, 255));
+        track.setColor(L.light() ? Color.argb(40, 0, 0, 0) : Color.argb(50, 255, 255, 255));
         track.setCornerRadius(dp(3));
-        GradientDrawable fill = new GradientDrawable(GradientDrawable.Orientation.RIGHT_LEFT,
+        GradientDrawable fill = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
                 new int[]{Color.rgb(150, 70, 255), Color.rgb(40, 140, 255), Color.rgb(0, 220, 255), Color.rgb(80, 255, 120)});
         fill.setCornerRadius(dp(3));
         ClipDrawable clip = new ClipDrawable(fill, Gravity.START, ClipDrawable.HORIZONTAL);
@@ -1018,7 +1368,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         tv.setText(s);
         tv.setTextSize(sp);
         tv.setTextColor(color);
-        tv.setTextDirection(View.TEXT_DIRECTION_RTL);
+        tv.setTextDirection(L.english() ? View.TEXT_DIRECTION_LTR : View.TEXT_DIRECTION_RTL);
         if (bold) tv.setTypeface(Typeface.DEFAULT_BOLD);
         return tv;
     }

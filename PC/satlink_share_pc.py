@@ -14,7 +14,7 @@ except ImportError:
     QT_BINDING = "PyQt5"
 
 APP_NAME = "SatLink Share PRO"
-APP_VERSION = "4.1"
+APP_VERSION = "5.0"
 DEVELOPER = "مهند سات لنك"
 ANDROID_TCP_PORT = 8988
 ANDROID_UDP_PORT = 8989
@@ -265,6 +265,8 @@ class Bus(QObject):
     log = Signal(str); progress = Signal(int); devices = Signal(list); receiving_state = Signal(str)
     transfer = Signal(str, str, int, str, str, str)  # direction, filename, percent, speed, ETA, state
     verify = Signal(str, str)  # peer name, 4-digit verification code shown while waiting for approval
+    incoming = Signal(object)  # approval request {name, code, count, total, files, legacy, event, result}
+    external_send = Signal(list)  # files handed over by Explorer's right-click "Send with SatLink"
 
 def transfer_eta(remaining, speed):
     if speed <= 0: return "—"
@@ -861,6 +863,9 @@ class Sender:
     def is_busy(self):
         with self.sockets_lock: return bool(self.sockets)
     def send_files(self, host, port, file_paths): threading.Thread(target=self._send_android_protocol, args=(host, int(port), file_paths), daemon=True).start()
+    def send_entries(self, host, port, entries):
+        """Send exact (path, relative name, size) entries, e.g. to resume stopped files."""
+        threading.Thread(target=self._send_android_protocol, args=(host, int(port), None, entries), daemon=True).start()
 
     def _track(self, s):
         with self.sockets_lock: self.sockets.add(s)
@@ -871,11 +876,13 @@ class Sender:
         try: s.close()
         except OSError: pass
 
-    def _send_android_protocol(self, host, port, file_paths):
+    def _send_android_protocol(self, host, port, file_paths, entries=None):
         self.cancelled.clear()
         self._current = {"name": None, "done": 0, "size": 0, "started": 0}
         try:
-            files = selected_entries(file_paths)
+            files = list(entries) if entries is not None else selected_entries(file_paths)
+            on_start = getattr(self, "on_batch_start", None)
+            if on_start: on_start(host, port, files)
             if not files: self.bus.log.emit("لم يتم اختيار ملفات صالحة."); return
             finished = set(); attempt = 0; start = time.time(); batch = os.urandom(8).hex()
             level = 0 if encryption_available() else 1   # 0 = V6 encrypted, 1 = V5, 2 = V3/V4
@@ -1088,37 +1095,127 @@ class Sender:
 def asset_path(name) -> Path:
     return Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "assets" / name
 
+# --------------------------------------------------------------------------- language / theme
+def ui_setting(key, default):
+    value = load_settings().get(key, default)
+    return value if isinstance(value, type(default)) else default
+
+LANG_EN = False
+def tr(ar, en): return en if LANG_EN else ar
+STATE_EN = {"جاري": "In progress", "مكتمل": "Done", "ملغي": "Cancelled", "فشل": "Failed", "مرفوض": "Declined", "متوقف": "Paused"}
+def state_text(state): return STATE_EN.get(state, state) if LANG_EN else state
+
+# --------------------------------------------------------------------------- history
 def history_path() -> Path:
     return settings_path().parent / "history.json"
 
 def load_history():
     try:
         data = json.loads(history_path().read_text(encoding="utf-8"))
-        return [h for h in data if isinstance(h, dict)][-300:] if isinstance(data, list) else []
+        return [h for h in data if isinstance(h, dict)][-400:] if isinstance(data, list) else []
     except (OSError, ValueError, TypeError):
         return []
 
 def save_history(entries):
     try:
         target = history_path(); target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(entries[-300:], ensure_ascii=False), encoding="utf-8")
+        target.write_text(json.dumps(entries[-400:], ensure_ascii=False), encoding="utf-8")
     except OSError:
         pass
 
 FINAL_STATES = ("مكتمل", "ملغي", "فشل", "مرفوض", "متوقف")
+RESUMABLE_STATES = ("ملغي", "فشل", "متوقف")
 
+# --------------------------------------------------------------------------- Explorer integration
+CONTROL_PORT = 8987
+SHELL_KEYS = (r"Software\Classes\*\shell\SatLinkSend", r"Software\Classes\Directory\shell\SatLinkSend")
+
+def acquire_instance_socket():
+    """The first SatLink process owns 127.0.0.1:8987; later ones hand their work to it."""
+    try:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if sys.platform.startswith("win"):
+            srv.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_EXCLUSIVEADDRUSE", socket.SO_REUSEADDR), 1)
+        srv.bind(("127.0.0.1", CONTROL_PORT)); srv.listen(16)
+        return srv
+    except OSError:
+        return None
+
+def forward_to_running_instance(paths) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", CONTROL_PORT), timeout=1.5) as s:
+            s.sendall(json.dumps({"send": [str(p) for p in paths], "show": True}).encode("utf-8"))
+        return True
+    except OSError:
+        return False
+
+def start_control_server(bus, srv):
+    def serve():
+        pending = []; lock = threading.Lock(); timer = {"t": None}
+        def flush():
+            with lock:
+                batch = list(dict.fromkeys(pending)); pending.clear()
+            bus.external_send.emit(batch)
+        while True:
+            try:
+                conn, _ = srv.accept()
+                with conn:
+                    conn.settimeout(2); data = b""
+                    while True:
+                        chunk = conn.recv(65536)
+                        if not chunk: break
+                        data += chunk
+                paths = [p for p in json.loads(data.decode("utf-8")).get("send", []) if isinstance(p, str)]
+                with lock: pending.extend(paths)
+                if timer["t"]: timer["t"].cancel()
+                timer["t"] = threading.Timer(0.8, flush); timer["t"].start()  # collect a multi-selection
+            except Exception:
+                continue
+    threading.Thread(target=serve, daemon=True).start()
+
+def shell_command():
+    return legacy_startup_command() + ' --send "%1"'
+
+def explorer_menu_installed():
+    if not sys.platform.startswith("win"): return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, SHELL_KEYS[0] + r"\command") as key:
+            return bool(winreg.QueryValueEx(key, "")[0])
+    except OSError:
+        return False
+
+def set_explorer_menu(enabled):
+    if not sys.platform.startswith("win"): raise OSError("Windows only")
+    import winreg
+    for base in SHELL_KEYS:
+        if enabled:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base) as key:
+                winreg.SetValueEx(key, "", 0, winreg.REG_SZ, tr("إرسال بـ SatLink", "Send with SatLink"))
+                winreg.SetValueEx(key, "Icon", 0, winreg.REG_SZ, str(Path(sys.executable).resolve()))
+                winreg.SetValueEx(key, "MultiSelectModel", 0, winreg.REG_SZ, "Player")
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base + r"\command") as key:
+                winreg.SetValueEx(key, "", 0, winreg.REG_SZ, shell_command())
+        else:
+            for sub in (base + r"\command", base):
+                try: winreg.DeleteKey(winreg.HKEY_CURRENT_USER, sub)
+                except OSError: pass
+
+# --------------------------------------------------------------------------- widgets
 class TransferTable(QTableWidget):
-    """قائمة الملفات المرسلة أو المستلمة: الأحدث بالأعلى مع شريط تقدم لكل ملف."""
-    def __init__(self):
-        super().__init__(0, 5)
-        self.setHorizontalHeaderLabels(["الملف", "التقدم", "السرعة", "المتبقي", "الحالة"])
+    """الملفات المرسلة أو المستلمة: الأحدث بالأعلى، مع شريط تقدم، والوقت، وزر «أكمل»."""
+    def __init__(self, on_resume=None):
+        super().__init__(0, 6)
+        self.on_resume = on_resume
+        self.setHorizontalHeaderLabels([tr("الملف", "File"), tr("التقدم", "Progress"), tr("السرعة", "Speed"),
+                                        tr("المتبقي", "Left"), tr("الحالة", "Status"), tr("الوقت", "Time")])
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.verticalHeader().setVisible(False)
         self.setShowGrid(False)
         header = self.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
-        for column, width in ((1, 170), (2, 100), (3, 90), (4, 90)):
+        for column, width in ((1, 150), (2, 90), (3, 80), (4, 110), (5, 120)):
             header.setSectionResizeMode(column, QHeaderView.Fixed); self.setColumnWidth(column, width)
         self.rows = {}
     def _new_row(self, filename):
@@ -1126,15 +1223,15 @@ class TransferTable(QTableWidget):
         name = QTableWidgetItem(filename); self.setItem(0, 0, name)
         bar = QProgressBar(); bar.setRange(0, 100); bar.setTextVisible(True); bar.setFormat("%p%")
         self.setCellWidget(0, 1, bar)
-        for column in (2, 3, 4): self.setItem(0, column, QTableWidgetItem(""))
-        self.setRowHeight(0, 38)
+        for column in (2, 3, 4, 5): self.setItem(0, column, QTableWidgetItem(""))
+        self.setRowHeight(0, 40)
         return name
-    def update_row(self, filename, percent, speed, eta, state):
+    def update_row(self, filename, percent, speed, eta, state, when=None, resumable=False):
         name_item = self.rows.get(filename)
         if name_item is not None:
             try: row = name_item.row()
             except RuntimeError: row = -1  # the row was removed from the table
-            if row < 0 or (self.item(row, 4) and self.item(row, 4).text() in FINAL_STATES and state == "جاري"):
+            if row < 0 or (self.item(row, 4) and self.item(row, 4).data(Qt.UserRole) in FINAL_STATES and state == "جاري"):
                 name_item = None
         if name_item is None:
             name_item = self._new_row(filename); self.rows[filename] = name_item
@@ -1143,16 +1240,48 @@ class TransferTable(QTableWidget):
         if bar is not None: bar.setValue(int(percent))
         self.item(row, 2).setText(speed if state == "جاري" else "")
         self.item(row, 3).setText(eta if state == "جاري" else "")
-        self.item(row, 4).setText(state)
+        status = self.item(row, 4); status.setText(state_text(state)); status.setData(Qt.UserRole, state)
+        self.item(row, 5).setText(time.strftime("%Y/%m/%d %H:%M", time.localtime(when or time.time())))
+        if resumable and self.on_resume:
+            button = QPushButton(tr("أكمل ↻", "Resume ↻")); button.setObjectName("Small")
+            button.clicked.connect(lambda _=False, f=filename: self.on_resume(f))
+            self.setCellWidget(row, 3, button)
+        elif isinstance(self.cellWidget(row, 3), QPushButton):
+            self.removeCellWidget(row, 3)
+    def apply_filter(self, text):
+        text = text.strip().lower()
+        for row in range(self.rowCount()):
+            item = self.item(row, 0)
+            self.setRowHidden(row, bool(text) and (item is None or text not in item.text().lower()))
 
+class DeviceList(QListWidget):
+    """قائمة الأجهزة: اسحب ملفات وأفلتها على جهاز ليبدأ الإرسال إليه مباشرة."""
+    def __init__(self, on_drop):
+        super().__init__(); self.on_drop = on_drop; self.setAcceptDrops(True)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls(): event.acceptProposedAction()
+        else: event.ignore()
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls(): event.acceptProposedAction()
+        else: event.ignore()
+    def dropEvent(self, event):
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        self.on_drop(self.itemAt(pos), paths); event.acceptProposedAction()
+
+# --------------------------------------------------------------------------- main window
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle(f"{APP_NAME} · {DEVELOPER}")
+        super().__init__(); self.setWindowTitle(f"{APP_NAME} · {tr(DEVELOPER, 'Muhannad SatLink')}")
         icon = asset_path("satlink_share_pc_icon.ico")
         if icon.exists(): self.setWindowIcon(QIcon(str(icon)))
-        self.resize(1040, 760); self.setMinimumSize(860, 640)
+        self.resize(1080, 780); self.setMinimumSize(900, 660); self.setAcceptDrops(True)
         self.bus = Bus(); self.receiver = ReceiverServer(self.bus); self.discovery = Discovery(self.bus); self.sender = Sender(self.bus)
-        self.selected_files = []; self.history = load_history()
+        self.sender.parallel = ui_setting("parallel", True)
+        self.sender.on_batch_start = self._remember_batch
+        self.receiver.decide = self._decide
+        self.selected_files = []; self.history = load_history(); self.sources = {}
         self._build_ui(); self._connect(); self._apply_style(); self._load_history_rows()
         self._really_exit = False; self._setup_tray()
 
@@ -1161,8 +1290,8 @@ class MainWindow(QMainWindow):
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
         self.tray.setToolTip(APP_NAME)
         menu = QMenu(self)
-        show_action = QAction("فتح SatLink", self); show_action.triggered.connect(self.show_window)
-        exit_action = QAction("إغلاق البرنامج نهائياً", self); exit_action.triggered.connect(self.exit_program)
+        show_action = QAction(tr("فتح SatLink", "Open SatLink"), self); show_action.triggered.connect(self.show_window)
+        exit_action = QAction(tr("إغلاق البرنامج نهائياً", "Quit"), self); exit_action.triggered.connect(self.exit_program)
         menu.addAction(show_action); menu.addSeparator(); menu.addAction(exit_action)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(lambda reason: self.show_window() if reason == QSystemTrayIcon.DoubleClick else None)
@@ -1177,9 +1306,22 @@ class MainWindow(QMainWindow):
         if self._really_exit or not QSystemTrayIcon.isSystemTrayAvailable():
             event.accept(); QApplication.instance().quit(); return
         event.ignore(); self.hide()
-        self.tray.showMessage(APP_NAME, "البرنامج يكمل الإرسال والاستلام بالخلفية بجوار الساعة. للإغلاق النهائي اضغط يمين على الأيقونة.", QSystemTrayIcon.Information, 3500)
+        self.tray.showMessage(APP_NAME, tr("البرنامج يكمل الإرسال والاستلام بالخلفية بجوار الساعة. للإغلاق النهائي اضغط يمين على الأيقونة.",
+                                           "SatLink keeps sending and receiving in the tray. Right-click the icon to quit."), QSystemTrayIcon.Information, 3500)
 
-    # ------------------------------------------------------------ UI
+    # ------------------------------------------------------------ drag & drop on the window
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls(): event.acceptProposedAction()
+    def dropEvent(self, event):
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        if paths: self.select_paths(paths)
+    def select_paths(self, paths):
+        paths = [p for p in paths if p and Path(p).exists()]
+        if not paths: self.show_window(); return
+        self.selected_files = list(dict.fromkeys(self.selected_files + paths))
+        self._update_selection_label(); self.show_send(); self.show_window()
+
+    # ------------------------------------------------------------ building blocks
     def _image_button(self, asset, fallback, width, height, slot):
         button = QPushButton(); button.setObjectName("ImageButton"); button.setCursor(Qt.PointingHandCursor)
         pix = QPixmap(str(asset_path(asset)))
@@ -1191,17 +1333,24 @@ class MainWindow(QMainWindow):
         return button
     def _header(self, layout, title, icon_name):
         row = QHBoxLayout(); row.setSpacing(12)
-        back = QPushButton("رجوع ›"); back.setObjectName("BackButton"); back.setCursor(Qt.PointingHandCursor); back.clicked.connect(self.show_home)
-        icon = QLabel(); pix = QPixmap(str(asset_path(icon_name)))
-        if not pix.isNull(): icon.setPixmap(pix.scaled(78, 62, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        texts = QVBoxLayout(); t = QLabel(title); t.setObjectName("PageTitle"); d = QLabel("المطور: " + DEVELOPER); d.setObjectName("Developer")
+        back = QPushButton(tr("رجوع ›", "‹ Back")); back.setObjectName("BackButton"); back.setCursor(Qt.PointingHandCursor); back.clicked.connect(self.show_home)
+        row.addWidget(back)
+        if icon_name:
+            icon = QLabel(); pix = QPixmap(str(asset_path(icon_name)))
+            if not pix.isNull(): icon.setPixmap(pix.scaled(78, 62, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            row.addWidget(icon)
+        texts = QVBoxLayout(); t = QLabel(title); t.setObjectName("PageTitle")
+        d = QLabel(tr("المطور: ", "Developer: ") + tr(DEVELOPER, "Muhannad SatLink")); d.setObjectName("Developer")
         texts.addWidget(t); texts.addWidget(d)
-        row.addWidget(back); row.addWidget(icon); row.addLayout(texts, 1)
+        row.addLayout(texts, 1)
         layout.addLayout(row)
     def _panel(self, title=None):
         frame = QFrame(); frame.setObjectName("Panel"); v = QVBoxLayout(frame); v.setContentsMargins(16, 14, 16, 14); v.setSpacing(10)
         if title: t = QLabel(title); t.setObjectName("PanelTitle"); v.addWidget(t)
         return frame, v
+    def _search(self, table):
+        box = QLineEdit(); box.setPlaceholderText("🔍 " + tr("بحث بالاسم", "Search by name"))
+        box.textChanged.connect(table.apply_filter); return box
 
     def _build_ui(self):
         root = QWidget(); root.setObjectName("Root"); root.setAttribute(Qt.WA_StyledBackground, True); self.setCentralWidget(root)
@@ -1209,202 +1358,351 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget(); outer.addWidget(self.stack)
 
         # الرئيسية: إرسال واستلام فقط
-        home = QWidget(); hv = QVBoxLayout(home); hv.setContentsMargins(30, 26, 30, 20); hv.setSpacing(12)
+        home = QWidget(); hv = QVBoxLayout(home); hv.setContentsMargins(30, 18, 30, 20); hv.setSpacing(10)
+        top = QHBoxLayout(); top.addStretch(1)
+        self.btn_settings = QPushButton("⚙  " + tr("الإعدادات", "Settings")); self.btn_settings.setObjectName("Ghost")
+        top.addWidget(self.btn_settings); hv.addLayout(top)
         title = QLabel(APP_NAME); title.setObjectName("HomeTitle"); title.setAlignment(Qt.AlignCenter)
-        dev = QLabel("المطور: " + DEVELOPER); dev.setObjectName("Developer"); dev.setAlignment(Qt.AlignCenter)
+        dev = QLabel(tr("المطور: ", "Developer: ") + tr(DEVELOPER, "Muhannad SatLink")); dev.setObjectName("Developer"); dev.setAlignment(Qt.AlignCenter)
         hv.addWidget(title); hv.addWidget(dev); hv.addStretch(1)
-        self.btn_home_send = self._image_button("card_send.png", "إرسال", 560, 222, self.show_send)
-        self.btn_home_receive = self._image_button("card_receive.png", "استلام", 560, 224, self.show_receive)
+        suffix = "_en" if LANG_EN else ""
+        self.btn_home_send = self._image_button(f"card_send{suffix}.png", tr("إرسال", "Send"), 560, 222, self.show_send)
+        self.btn_home_receive = self._image_button(f"card_receive{suffix}.png", tr("استلام", "Receive"), 560, 224, self.show_receive)
         hv.addWidget(self.btn_home_send, 0, Qt.AlignHCenter); hv.addSpacing(6); hv.addWidget(self.btn_home_receive, 0, Qt.AlignHCenter)
         hv.addStretch(1)
-        self.home_status = QLabel("بالراوتر أو بدون راوتر · سريع · بدون إنترنت"); self.home_status.setObjectName("Muted"); self.home_status.setAlignment(Qt.AlignCenter)
+        self.home_status = QLabel(""); self.home_status.setObjectName("Muted"); self.home_status.setAlignment(Qt.AlignCenter)
         hv.addWidget(self.home_status)
         self.stack.addWidget(home)
 
         # صفحة الإرسال
         send = QWidget(); sv = QVBoxLayout(send); sv.setContentsMargins(24, 16, 24, 16); sv.setSpacing(12)
-        self._header(sv, "إرسال", "ic_send.png")
+        self._header(sv, tr("إرسال", "Send"), "ic_send.png")
         pick = QHBoxLayout()
-        self.btn_choose_files = QPushButton("اختيار ملفات"); self.btn_choose_folder = QPushButton("اختيار مجلد")
-        self.files_label = QLabel("اختر الملفات، ثم اضغط على الجهاز المستلم وسيبدأ الإرسال"); self.files_label.setObjectName("Muted"); self.files_label.setWordWrap(True)
+        self.btn_choose_files = QPushButton("📄 " + tr("اختيار ملفات", "Choose files")); self.btn_choose_folder = QPushButton("📁 " + tr("اختيار مجلد", "Choose folder"))
+        self.files_label = QLabel(""); self.files_label.setObjectName("Muted"); self.files_label.setWordWrap(True)
         pick.addWidget(self.btn_choose_files); pick.addWidget(self.btn_choose_folder); pick.addWidget(self.files_label, 1)
         sv.addLayout(pick)
         body = QHBoxLayout(); body.setSpacing(14)
-        devices, dv = self._panel("الأجهزة القريبة")
-        self.device_list = QListWidget(); self.device_list.setObjectName("DeviceList"); self.device_list.setCursor(Qt.PointingHandCursor)
+        devices, dv = self._panel(tr("الأجهزة القريبة", "Nearby devices"))
+        self.device_list = DeviceList(self.on_drop_device); self.device_list.setObjectName("DeviceList"); self.device_list.setCursor(Qt.PointingHandCursor)
         self.scan_label = QLabel(""); self.scan_label.setObjectName("Muted"); self.scan_label.setWordWrap(True)
-        self.btn_search = QPushButton("↻ بحث")
-        manual = QHBoxLayout(); self.manual_host = QLineEdit(); self.manual_host.setPlaceholderText("IP يدوي مثل 192.168.1.20"); self.btn_use_manual = QPushButton("إضافة")
+        buttons = QHBoxLayout(); self.btn_search = QPushButton("↻ " + tr("بحث", "Scan"))
+        self.btn_send_selected = QPushButton(tr("إرسال للأجهزة المحددة", "Send to selected"))
+        buttons.addWidget(self.btn_search); buttons.addWidget(self.btn_send_selected)
+        manual = QHBoxLayout(); self.manual_host = QLineEdit(); self.manual_host.setPlaceholderText(tr("IP يدوي مثل 192.168.1.20", "Manual IP e.g. 192.168.1.20")); self.btn_use_manual = QPushButton(tr("إضافة", "Add"))
         manual.addWidget(self.manual_host, 1); manual.addWidget(self.btn_use_manual)
-        dv.addWidget(self.device_list, 1); dv.addWidget(self.scan_label); dv.addWidget(self.btn_search); dv.addLayout(manual)
-        sent, tv = self._panel("الملفات المرسلة")
-        self.sent_table = TransferTable(); tv.addWidget(self.sent_table, 1)
-        srow = QHBoxLayout(); self.btn_cancel_send = QPushButton("إلغاء الإرسال"); self.btn_cancel_send.setObjectName("Danger")
-        self.btn_clear_sent = QPushButton("مسح السجل"); self.btn_clear_sent.setObjectName("Ghost")
-        srow.addWidget(self.btn_cancel_send); srow.addWidget(self.btn_clear_sent); srow.addStretch(1); tv.addLayout(srow)
+        dv.addWidget(self.device_list, 1); dv.addWidget(self.scan_label); dv.addLayout(buttons); dv.addLayout(manual)
+        sent, tv = self._panel(tr("الملفات المرسلة", "Sent files"))
+        self.sent_table = TransferTable(self.resume_file); tv.addWidget(self._search(self.sent_table)); tv.addWidget(self.sent_table, 1)
+        srow = QHBoxLayout(); self.btn_cancel_send = QPushButton(tr("إلغاء الإرسال", "Cancel")); self.btn_cancel_send.setObjectName("Danger")
+        self.btn_resume_all = QPushButton(tr("أكمل الكل ↻", "Resume all ↻"))
+        self.btn_clear_sent = QPushButton(tr("مسح السجل", "Clear history")); self.btn_clear_sent.setObjectName("Ghost")
+        srow.addWidget(self.btn_cancel_send); srow.addWidget(self.btn_resume_all); srow.addWidget(self.btn_clear_sent); srow.addStretch(1); tv.addLayout(srow)
         body.addWidget(devices, 2); body.addWidget(sent, 3); sv.addLayout(body, 1)
         self.send_status = QLabel(""); self.send_status.setObjectName("Muted"); sv.addWidget(self.send_status)
         self.stack.addWidget(send)
 
         # صفحة الاستلام
         recv = QWidget(); rv = QVBoxLayout(recv); rv.setContentsMargins(24, 16, 24, 16); rv.setSpacing(12)
-        self._header(rv, "استلام", "ic_receive.png")
-        top = QHBoxLayout(); top.setSpacing(14)
+        self._header(rv, tr("استلام", "Receive"), "ic_receive.png")
+        topr = QHBoxLayout(); topr.setSpacing(14)
         info, iv = self._panel()
-        self.receive_state = QLabel("● الاستلام متوقف"); self.receive_state.setObjectName("StateOff")
+        self.receive_state = QLabel(tr("● الاستلام متوقف", "● Receiving is off")); self.receive_state.setObjectName("StateOff")
         name = QLabel(pc_name()); name.setObjectName("PanelTitle")
         self.addresses_label = QLabel(""); self.addresses_label.setObjectName("Muted"); self.addresses_label.setWordWrap(True)
         self.receive_path_label = QLabel(""); self.receive_path_label.setObjectName("Muted"); self.receive_path_label.setWordWrap(True)
-        buttons = QHBoxLayout()
-        self.btn_choose_receive = QPushButton("مكان الحفظ (C / D / E)"); self.btn_open_received = QPushButton("فتح المجلد")
-        self.btn_stop_receive = QPushButton("إيقاف الاستلام"); self.btn_stop_receive.setObjectName("Danger")
-        buttons.addWidget(self.btn_choose_receive); buttons.addWidget(self.btn_open_received); buttons.addWidget(self.btn_stop_receive)
-        self.startup_toggle = QCheckBox("تشغيل مع Windows بجوار الساعة (الاستلام تلقائي)")
+        self.security_label = QLabel(""); self.security_label.setObjectName("Muted"); self.security_label.setWordWrap(True)
+        rbuttons = QHBoxLayout()
+        self.btn_choose_receive = QPushButton(tr("مكان الحفظ (C / D / E)", "Save location")); self.btn_open_received = QPushButton(tr("فتح المجلد", "Open folder"))
+        self.btn_stop_receive = QPushButton(tr("إيقاف الاستلام", "Stop receiving")); self.btn_stop_receive.setObjectName("Danger")
+        rbuttons.addWidget(self.btn_choose_receive); rbuttons.addWidget(self.btn_open_received); rbuttons.addWidget(self.btn_stop_receive)
+        self.startup_toggle = QCheckBox(tr("تشغيل مع Windows بجوار الساعة (الاستلام تلقائي)", "Start with Windows in the tray (auto receive)"))
         self.startup_toggle.setChecked(startup_enabled()); self.startup_toggle.setEnabled(sys.platform.startswith("win"))
-        for w in (self.receive_state, name, self.addresses_label, self.receive_path_label): iv.addWidget(w)
-        iv.addLayout(buttons); iv.addWidget(self.startup_toggle)
-        vnet, vv = self._panel("بدون راوتر")
-        hint = QLabel("• من الهاتف: افتح «استلام» وفعّل «شبكة SatLink»، ثم اتصل من واي فاي الحاسبة بالاسم وكلمة المرور الظاهرين بالهاتف.\n"
-                      "• أو شغّل نقطة الاتصال في Windows واجعل الهاتف يتصل بها.\nبعدها يظهر الجهازان لبعض تلقائياً.")
+        for w in (self.receive_state, name, self.addresses_label, self.receive_path_label, self.security_label): iv.addWidget(w)
+        iv.addLayout(rbuttons); iv.addWidget(self.startup_toggle)
+        vnet, vv = self._panel(tr("بدون راوتر", "Without a router"))
+        hint = QLabel(tr("• من الهاتف: افتح «استلام» وفعّل «شبكة SatLink»، ثم اتصل من واي فاي الحاسبة بالاسم وكلمة المرور الظاهرين بالهاتف.\n"
+                         "• أو شغّل نقطة الاتصال في Windows واجعل الهاتف يتصل بها.\nبعدها يظهر الجهازان لبعض تلقائياً.",
+                         "• On the phone: open Receive and turn on “SatLink network”, then join it from the PC's Wi‑Fi with the name and password shown on the phone.\n"
+                         "• Or turn on Windows Mobile Hotspot and connect the phone to it.\nThe devices then find each other automatically."))
         hint.setObjectName("Muted"); hint.setWordWrap(True)
-        self.btn_hotspot = QPushButton("فتح نقطة الاتصال في Windows"); self.btn_wifi = QPushButton("فتح شبكات الواي فاي")
+        self.btn_hotspot = QPushButton(tr("فتح نقطة الاتصال في Windows", "Open Windows hotspot")); self.btn_wifi = QPushButton(tr("فتح شبكات الواي فاي", "Open Wi‑Fi networks"))
         vv.addWidget(hint); vv.addWidget(self.btn_hotspot); vv.addWidget(self.btn_wifi); vv.addStretch(1)
-        top.addWidget(info, 3); top.addWidget(vnet, 2); rv.addLayout(top)
-        received, tv2 = self._panel("الملفات المستلمة")
-        self.received_table = TransferTable(); tv2.addWidget(self.received_table, 1)
-        rrow = QHBoxLayout(); self.btn_cancel_receive = QPushButton("إلغاء الملف الجاري"); self.btn_cancel_receive.setObjectName("Danger")
-        self.btn_clear_received = QPushButton("مسح السجل"); self.btn_clear_received.setObjectName("Ghost")
+        topr.addWidget(info, 3); topr.addWidget(vnet, 2); rv.addLayout(topr)
+        received, tv2 = self._panel(tr("الملفات المستلمة", "Received files"))
+        self.received_table = TransferTable(); tv2.addWidget(self._search(self.received_table)); tv2.addWidget(self.received_table, 1)
+        rrow = QHBoxLayout(); self.btn_cancel_receive = QPushButton(tr("إلغاء الملف الجاري", "Cancel current")); self.btn_cancel_receive.setObjectName("Danger")
+        self.btn_clear_received = QPushButton(tr("مسح السجل", "Clear history")); self.btn_clear_received.setObjectName("Ghost")
         rrow.addWidget(self.btn_cancel_receive); rrow.addWidget(self.btn_clear_received); rrow.addStretch(1); tv2.addLayout(rrow)
         rv.addWidget(received, 1)
         self.status_line = QLabel(""); self.status_line.setObjectName("Muted"); rv.addWidget(self.status_line)
         self.stack.addWidget(recv)
-        self.refresh_receive_info()
+
+        # صفحة الإعدادات
+        settings = QWidget(); stv = QVBoxLayout(settings); stv.setContentsMargins(24, 16, 24, 16); stv.setSpacing(12)
+        self._header(stv, tr("الإعدادات", "Settings"), None)
+        look, lv = self._panel(tr("المظهر", "Appearance"))
+        self.lang_toggle = QCheckBox("English"); self.lang_toggle.setChecked(LANG_EN)
+        self.light_toggle = QCheckBox(tr("ثيم فاتح", "Light theme")); self.light_toggle.setChecked(ui_setting("light", False))
+        note = QLabel(tr("تغيير اللغة يتطبق عند إعادة فتح البرنامج.", "Language changes apply after restarting the program.")); note.setObjectName("Muted")
+        lv.addWidget(self.lang_toggle); lv.addWidget(self.light_toggle); lv.addWidget(note)
+        sec, sev = self._panel(tr("الأمان والنقل", "Security & transfer"))
+        self.ask_toggle = QCheckBox(tr("اسأل قبل الاستلام من جهاز جديد", "Ask before receiving from a new device")); self.ask_toggle.setChecked(ui_setting("ask_unknown", True))
+        self.parallel_toggle = QCheckBox(tr("تسريع الملفات الكبيرة (عدة اتصالات)", "Speed up large files (several connections)")); self.parallel_toggle.setChecked(ui_setting("parallel", True))
+        self.menu_toggle = QCheckBox(tr("إضافة «إرسال بـ SatLink» لقائمة الزر الأيمن في Windows", "Add “Send with SatLink” to the Windows right-click menu"))
+        self.menu_toggle.setChecked(explorer_menu_installed()); self.menu_toggle.setEnabled(sys.platform.startswith("win"))
+        enc = QLabel(tr("🔒 التشفير مفعل", "🔒 Encryption on") if encryption_available() else tr("⚠ التشفير غير متوفر بهذه النسخة", "⚠ Encryption unavailable in this build")); enc.setObjectName("Muted")
+        for w in (self.ask_toggle, self.parallel_toggle, self.menu_toggle, enc): sev.addWidget(w)
+        trust, tl = self._panel(tr("الأجهزة الموثوقة", "Trusted devices"))
+        self.trusted_list = QListWidget(); self.btn_forget = QPushButton(tr("حذف الجهاز المحدد", "Remove selected")); self.btn_forget.setObjectName("Danger")
+        tl.addWidget(self.trusted_list, 1); tl.addWidget(self.btn_forget)
+        about = QLabel(f"{APP_NAME} {APP_VERSION} · " + tr("المطور: ", "Developer: ") + tr(DEVELOPER, "Muhannad SatLink")); about.setObjectName("Muted")
+        grid = QHBoxLayout(); left = QVBoxLayout(); left.addWidget(look); left.addWidget(sec); left.addStretch(1)
+        grid.addLayout(left, 1); grid.addWidget(trust, 1); stv.addLayout(grid, 1); stv.addWidget(about)
+        self.stack.addWidget(settings)
+        self.refresh_receive_info(); self._update_selection_label(); self._update_home_status()
 
     def _connect(self):
+        self.btn_settings.clicked.connect(self.show_settings)
         self.btn_choose_files.clicked.connect(self.choose_files); self.btn_choose_folder.clicked.connect(self.choose_folder)
         self.btn_search.clicked.connect(self.start_search); self.btn_use_manual.clicked.connect(self.use_manual)
+        self.btn_send_selected.clicked.connect(self.send_to_selected)
         self.device_list.itemClicked.connect(self.on_device_clicked)
         self.btn_cancel_send.clicked.connect(self.sender.cancel_current); self.btn_cancel_receive.clicked.connect(self.receiver.cancel_current)
+        self.btn_resume_all.clicked.connect(self.resume_all)
         self.btn_clear_sent.clicked.connect(lambda: self.clear_history("إرسال")); self.btn_clear_received.clicked.connect(lambda: self.clear_history("استلام"))
         self.btn_choose_receive.clicked.connect(self.choose_receive_location); self.btn_open_received.clicked.connect(self.open_received)
         self.btn_stop_receive.clicked.connect(self.stop_receiving); self.startup_toggle.toggled.connect(self.toggle_startup)
         self.btn_hotspot.clicked.connect(lambda: self.open_settings("ms-settings:network-mobilehotspot"))
         self.btn_wifi.clicked.connect(lambda: self.open_settings("ms-settings:network-wifi"))
+        self.lang_toggle.toggled.connect(lambda on: save_settings({"lang": "en" if on else "ar"}))
+        self.light_toggle.toggled.connect(self.toggle_light)
+        self.ask_toggle.toggled.connect(lambda on: save_settings({"ask_unknown": bool(on)}))
+        self.parallel_toggle.toggled.connect(self.toggle_parallel)
+        self.menu_toggle.toggled.connect(self.toggle_menu)
+        self.btn_forget.clicked.connect(self.forget_selected)
         self.bus.log.connect(self.add_log); self.bus.devices.connect(self.update_devices); self.bus.receiving_state.connect(self.update_receiving_state)
-        self.bus.transfer.connect(self.update_transfer)
+        self.bus.transfer.connect(self.update_transfer); self.bus.verify.connect(self.show_code)
+        self.bus.incoming.connect(self.ask_incoming); self.bus.external_send.connect(self.select_paths)
 
     # ------------------------------------------------------------ navigation
     def show_home(self):
         self.discovery.stop(); self.stack.setCurrentIndex(0); self._update_home_status()
     def show_send(self):
-        self.stack.setCurrentIndex(1); self.start_search()
+        if self.stack.currentIndex() != 1: self.stack.setCurrentIndex(1); self.start_search()
     def show_receive(self):
         self.stack.setCurrentIndex(2); self.refresh_receive_info()
         if not self.receiver.is_running(): self.receiver.start()
+    def show_settings(self):
+        self.trusted_list.clear()
+        for device, info in trusted_devices().items():
+            item = QListWidgetItem("✓ " + str(info.get("name", device))); item.setData(Qt.UserRole, device); self.trusted_list.addItem(item)
+        if self.trusted_list.count() == 0:
+            item = QListWidgetItem(tr("لا يوجد · اختر «قبول دائماً» عند الاستلام", "None · choose “Always accept” when receiving")); item.setFlags(Qt.NoItemFlags); self.trusted_list.addItem(item)
+        self.stack.setCurrentIndex(3)
     def _update_home_status(self):
         parts = []
-        if self.receiver.is_running(): parts.append("الاستلام شغال بالخلفية")
-        if self.sender.is_busy(): parts.append("الإرسال شغال بالخلفية")
-        self.home_status.setText("  ·  ".join(parts) or "بالراوتر أو بدون راوتر · سريع · بدون إنترنت")
+        if self.receiver.is_running(): parts.append(tr("الاستلام شغال بالخلفية", "Receiving in background"))
+        if self.sender.is_busy(): parts.append(tr("الإرسال شغال بالخلفية", "Sending in background"))
+        self.home_status.setText("  ·  ".join(parts) or tr("بالراوتر أو بدون راوتر · مشفر · اسحب الملفات وأفلتها هنا",
+                                                          "With or without a router · encrypted · drop files here"))
 
     # ------------------------------------------------------------ send
+    def _update_selection_label(self):
+        if not self.selected_files:
+            self.files_label.setText(tr("اختر أو اسحب ملفات إلى هنا، ثم اضغط على الجهاز (أو أفلتها على الجهاز مباشرة)",
+                                        "Choose or drag files here, then click a device (or drop them right on a device)")); return
+        size = 0
+        for f in self.selected_files:
+            p = Path(f)
+            if p.is_file(): size += p.stat().st_size
+        names = ", ".join(Path(f).name for f in self.selected_files[:3]) + ("…" if len(self.selected_files) > 3 else "")
+        self.files_label.setText(f"✓ {names} · {size/1024/1024:.1f} MB — " + tr("اضغط على الجهاز المستلم", "click the receiving device"))
     def start_search(self):
         self.discovery.stop(); self.device_list.clear()
-        self.scan_label.setText("جاري البحث على كل الشبكات المتصلة...")
+        self.scan_label.setText(tr("جاري البحث على كل الشبكات المتصلة...", "Searching all connected networks..."))
         QTimer.singleShot(150, self.discovery.start)
-        QTimer.singleShot(13000, lambda: self.device_list.count() == 0 and self.scan_label.setText("لم يظهر جهاز. افتح «استلام» في الجهاز الثاني أو أضف IP يدوي."))
+        QTimer.singleShot(13000, lambda: self.device_list.count() == 0 and self.scan_label.setText(
+            tr("لم يظهر جهاز. افتح «استلام» في الجهاز الثاني أو أضف IP يدوي.", "No device found. Open Receive on the other device or add its IP.")))
     def update_devices(self, devices):
         self.device_list.clear()
         for dev in devices:
             label = ("🖥  " if "pc" in dev.get("name", "").lower() else "📱  ") + f"{dev.get('name')}\n      {network_label(dev.get('ip', ''))} · {dev.get('ip')}"
             item = QListWidgetItem(label); item.setData(Qt.UserRole, dev); item.setSizeHint(QSize(100, 58)); self.device_list.addItem(item)
-        self.scan_label.setText("اضغط على الجهاز ليبدأ الإرسال" if devices else "")
+        self.scan_label.setText(tr("اضغط على الجهاز ليبدأ الإرسال · Ctrl لتحديد أكثر من جهاز · أو أفلت الملفات على الجهاز",
+                                   "Click a device to send · Ctrl-click for several · or drop files on a device") if devices else "")
+    def _send_to(self, device, paths):
+        self.sender.send_files(device["ip"], device.get("port", ANDROID_TCP_PORT), paths)
+        self.send_status.setText(tr("بدأ الإرسال إلى ", "Sending to ") + str(device.get("name")))
     def on_device_clicked(self, item):
+        if QApplication.keyboardModifiers() & (Qt.ControlModifier | Qt.ShiftModifier): return  # multi-select
         device = item.data(Qt.UserRole)
         if not self.selected_files:
-            self.send_status.setText("اختر ملفات أولاً ثم اضغط على الجهاز"); self.choose_files()
+            self.send_status.setText(tr("اختر ملفات أولاً ثم اضغط على الجهاز", "Choose files first, then click the device")); self.choose_files()
             if not self.selected_files: return
-        self.sender.send_files(device["ip"], device.get("port", ANDROID_TCP_PORT), self.selected_files)
-        self.send_status.setText(f"بدأ الإرسال إلى {device.get('name')}")
-        self.selected_files = []; self.files_label.setText("اختر ملفات جديدة للإرسال التالي")
+        self._send_to(device, self.selected_files)
+        self.selected_files = []; self._update_selection_label()
+    def send_to_selected(self):
+        items = self.device_list.selectedItems()
+        if not items: self.send_status.setText(tr("حدد الأجهزة بالضغط مع Ctrl", "Select devices with Ctrl-click")); return
+        if not self.selected_files: self.choose_files()
+        if not self.selected_files: return
+        for item in items:
+            # each device gets its own sender so the transfers run at the same time
+            device = item.data(Qt.UserRole); extra = Sender(self.bus); extra.parallel = self.sender.parallel; extra.on_batch_start = self._remember_batch
+            extra.send_files(device["ip"], device.get("port", ANDROID_TCP_PORT), list(self.selected_files))
+        self.send_status.setText(tr("بدأ الإرسال إلى ", "Sending to ") + str(len(items)) + tr(" أجهزة", " devices"))
+        self.selected_files = []; self._update_selection_label()
+    def on_drop_device(self, item, paths):
+        if not paths: return
+        if item is None: self.select_paths(paths); return
+        self._send_to(item.data(Qt.UserRole), paths)
     def choose_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "اختيار ملفات للإرسال")
-        if files:
-            self.selected_files = files
-            size = sum(Path(f).stat().st_size for f in files if Path(f).is_file())
-            self.files_label.setText(f"✓ {len(files)} ملف · {size/1024/1024:.1f} MB — اضغط على الجهاز المستلم")
+        files, _ = QFileDialog.getOpenFileNames(self, tr("اختيار ملفات للإرسال", "Choose files to send"))
+        if files: self.selected_files = list(dict.fromkeys(self.selected_files + files)); self._update_selection_label()
     def choose_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "اختيار مجلد للإرسال")
-        if folder:
-            self.selected_files = [folder]; self.files_label.setText("✓ المجلد: " + Path(folder).name + " — اضغط على الجهاز المستلم")
+        folder = QFileDialog.getExistingDirectory(self, tr("اختيار مجلد للإرسال", "Choose a folder to send"))
+        if folder: self.selected_files = list(dict.fromkeys(self.selected_files + [folder])); self._update_selection_label()
     def use_manual(self):
         text = self.manual_host.text().strip()
         parts = text.split(".")
         if len(parts) != 4 or not all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
-            QMessageBox.warning(self, "تنبيه", "اكتب IP صحيح مثل 192.168.1.20"); return
+            QMessageBox.warning(self, "SatLink", tr("اكتب IP صحيح مثل 192.168.1.20", "Enter a valid IP like 192.168.1.20")); return
         self.discovery._add_device(f"SatLink · {text}", text, ANDROID_TCP_PORT)
+
+    # ------------------------------------------------------------ resume
+    def _remember_batch(self, host, port, entries):
+        for path, name, size in entries: self.sources[name] = {"path": str(path), "size": size, "host": host, "port": port}
+    def resume_file(self, name):
+        info = self.sources.get(name) or next((h.get("source") for h in reversed(self.history) if h.get("name") == name and h.get("source")), None)
+        if not info or not Path(info["path"]).is_file():
+            self.send_status.setText(tr("الملف الأصلي غير موجود", "The original file is missing")); return
+        self.sender.send_entries(info["host"], info["port"], [(Path(info["path"]), name, info["size"])])
+    def resume_all(self):
+        groups = {}
+        for row in range(self.sent_table.rowCount()):
+            status = self.sent_table.item(row, 4)
+            if status is None or status.data(Qt.UserRole) not in RESUMABLE_STATES: continue
+            name = self.sent_table.item(row, 0).text(); info = self.sources.get(name)
+            if info and Path(info["path"]).is_file():
+                groups.setdefault((info["host"], info["port"]), []).append((Path(info["path"]), name, info["size"]))
+        for (host, port), entries in groups.items(): Sender(self.bus).send_entries(host, port, entries)
+        self.send_status.setText(tr("جاري الإكمال من آخر نقطة", "Resuming from where it stopped") if groups else tr("لا توجد ملفات متوقفة", "Nothing to resume"))
+
+    # ------------------------------------------------------------ approval & verification code
+    def _decide(self, request):
+        """Called on a network thread; shows the question on the UI thread and waits for the answer."""
+        if not ui_setting("ask_unknown", True): return DECISION_ACCEPT
+        request = dict(request); request["event"] = threading.Event(); request["result"] = DECISION_REJECT
+        self.bus.incoming.emit(request)
+        request["event"].wait(60)
+        return request["result"]
+    def ask_incoming(self, request):
+        self.show_window()
+        self.tray.showMessage(APP_NAME, tr("طلب استلام من ", "Incoming files from ") + str(request["name"]), QSystemTrayIcon.Information, 4000)
+        box = QMessageBox(self); box.setWindowTitle(tr("طلب استلام", "Incoming files"))
+        files = "\n".join("• " + f for f in request.get("files", []) or [])
+        text = (tr("الجهاز: ", "Device: ") + str(request["name"]) + "\n" + f"{request['count']} " + tr("ملف", "files")
+                + f" · {request['total']/1024/1024:.1f} MB" + ("\n" + files if files else ""))
+        if request.get("code"):
+            text += "\n\n" + tr("رمز التحقق: ", "Verification code: ") + request["code"] + "\n" + tr("تأكد أنه نفس الرمز الظاهر على الجهاز المرسل.", "Make sure the sender shows the same code.")
+        else:
+            text += "\n\n" + tr("⚠ الجهاز المرسل بنسخة قديمة (بدون تشفير).", "⚠ The sender uses an old version (not encrypted).")
+        box.setText(text)
+        accept = box.addButton(tr("قبول", "Accept"), QMessageBox.AcceptRole)
+        always = box.addButton(tr("قبول دائماً", "Always accept"), QMessageBox.YesRole) if request.get("code") else None
+        box.addButton(tr("رفض", "Decline"), QMessageBox.RejectRole)
+        QTimer.singleShot(58000, box.reject)
+        box.exec() if QT_BINDING == "PySide6" else box.exec_()
+        clicked = box.clickedButton()
+        request["result"] = DECISION_TRUST if always is not None and clicked is always else DECISION_ACCEPT if clicked is accept else DECISION_REJECT
+        request["event"].set()
+    def show_code(self, peer, code):
+        box = QMessageBox(self); box.setWindowTitle(tr("رمز التحقق", "Verification code"))
+        box.setText(f"<div style='font-size:44px;font-weight:900;letter-spacing:10px;color:#00dcff;text-align:center'>{code}</div>"
+                    + tr("تأكد أن نفس الرمز ظاهر على الجهاز المستلم ثم وافق هناك.", "Check that the receiving device shows the same code, then accept there."))
+        box.setModal(False); box.show()
+        QTimer.singleShot(60000, box.close)
 
     # ------------------------------------------------------------ receive
     def refresh_receive_info(self):
-        lines = [f"{network_label(ip)}: {ip}" for ip in local_ipv4_addresses()]
-        self.addresses_label.setText("\n".join(lines) or "غير متصل بشبكة")
-        self.receive_path_label.setText("مكان الحفظ: " + str(receive_destination_path()))
+        lines = [f"{network_label(ip) if not LANG_EN else {'الراوتر': 'Router'}.get(network_label(ip), network_label(ip))}: {ip}" for ip in local_ipv4_addresses()]
+        self.addresses_label.setText("\n".join(lines) or tr("غير متصل بشبكة", "Not connected"))
+        self.receive_path_label.setText(tr("مكان الحفظ: ", "Saving to: ") + str(receive_destination_path()))
+        self.security_label.setText((tr("🔒 مشفر", "🔒 Encrypted") if encryption_available() else tr("⚠ بدون تشفير", "⚠ Not encrypted")) + " · "
+                                    + (tr("يسألك قبل الاستلام من جهاز جديد", "asks before accepting a new device") if ui_setting("ask_unknown", True)
+                                       else tr("يقبل كل الأجهزة", "accepts every device")))
     def stop_receiving(self):
         self.receiver.stop(); self.show_home()
     def update_receiving_state(self, state):
         on = state == "يعمل"
-        self.receive_state.setText("● الاستلام شغال" if on else ("● الاستلام متوقف" if state == "متوقف" else "● تعذر تشغيل الاستلام"))
+        self.receive_state.setText(tr("● الاستلام شغال", "● Receiving is on") if on else (tr("● الاستلام متوقف", "● Receiving is off") if state == "متوقف" else tr("● تعذر تشغيل الاستلام", "● Could not start receiving")))
         self.receive_state.setObjectName("StateOn" if on else "StateOff")
         self.receive_state.style().unpolish(self.receive_state); self.receive_state.style().polish(self.receive_state)
-        if hasattr(self, "tray"): self.tray.setToolTip("SatLink · الاستلام " + state)
+        if hasattr(self, "tray"): self.tray.setToolTip("SatLink · " + (tr("الاستلام شغال", "receiving") if on else tr("الاستلام متوقف", "not receiving")))
     def choose_receive_location(self):
         current = receive_base()
-        folder = QFileDialog.getExistingDirectory(self, "اختيار القرص أو المجلد للاستلام", str(current if current.is_dir() else Path.home()))
+        folder = QFileDialog.getExistingDirectory(self, tr("اختيار القرص أو المجلد للاستلام", "Choose where to save"), str(current if current.is_dir() else Path.home()))
         if not folder: return
         try:
             destination = set_receive_base(folder)
-            self.receive_path_label.setText("مكان الحفظ: " + str(destination))
-            self.status_line.setText("مكان الاستلام الجديد ينطبق على النقل التالي")
+            self.receive_path_label.setText(tr("مكان الحفظ: ", "Saving to: ") + str(destination))
         except OSError:
-            self.status_line.setText("تعذر حفظ مكان الاستلام. تأكد أن القرص متصل وقابل للكتابة.")
+            self.status_line.setText(tr("تعذر حفظ مكان الاستلام. تأكد أن القرص متصل وقابل للكتابة.", "Could not use that location."))
     def open_received(self):
         try:
             path = downloads_received_dir()
             if sys.platform.startswith("win"): os.startfile(path)
             elif sys.platform == "darwin": subprocess.Popen(["open", str(path)])
             else: subprocess.Popen(["xdg-open", str(path)])
-        except Exception: self.status_line.setText("تعذر فتح مجلد الاستلام")
+        except Exception: self.status_line.setText(tr("تعذر فتح مجلد الاستلام", "Could not open the folder"))
     def open_settings(self, uri):
         if not QDesktopServices.openUrl(QUrl(uri)):
-            self.status_line.setText("افتح الإعدادات > الشبكة والإنترنت يدوياً")
+            self.status_line.setText(tr("افتح الإعدادات > الشبكة والإنترنت يدوياً", "Open Settings > Network & Internet"))
     def toggle_startup(self, enabled):
-        try:
-            set_startup_enabled(enabled)
-            self.status_line.setText("التشغيل مع Windows مفعل" if enabled else "التشغيل مع Windows متوقف")
+        try: set_startup_enabled(enabled)
         except OSError:
             self.startup_toggle.blockSignals(True); self.startup_toggle.setChecked(not enabled); self.startup_toggle.blockSignals(False)
-            self.status_line.setText("تعذر تغيير إعداد بدء التشغيل")
+
+    # ------------------------------------------------------------ settings
+    def toggle_light(self, on):
+        save_settings({"light": bool(on)}); self._apply_style()
+    def toggle_parallel(self, on):
+        save_settings({"parallel": bool(on)}); self.sender.parallel = bool(on)
+    def toggle_menu(self, on):
+        try: set_explorer_menu(on)
+        except OSError:
+            self.menu_toggle.blockSignals(True); self.menu_toggle.setChecked(not on); self.menu_toggle.blockSignals(False)
+    def forget_selected(self):
+        for item in self.trusted_list.selectedItems():
+            device = item.data(Qt.UserRole)
+            if device: forget_trusted(device)
+        self.show_settings()
 
     # ------------------------------------------------------------ transfers & history
     def update_transfer(self, direction, filename, percent, speed, eta, state):
         table = self.sent_table if direction == "إرسال" else self.received_table
-        table.update_row(filename, percent, speed, eta, state)
+        resumable = direction == "إرسال" and state in RESUMABLE_STATES and filename in self.sources
+        table.update_row(filename, percent, speed, eta, state, resumable=resumable)
         if state in FINAL_STATES:
-            self.history.append({"dir": direction, "name": filename, "state": state, "percent": percent, "time": int(time.time())})
-            save_history(self.history)
-        if hasattr(self, "tray"): self.tray.setToolTip(f"SatLink · {direction} · {filename[:50]} · {percent}% · {state}")
+            entry = {"dir": direction, "name": filename, "state": state, "percent": percent, "time": int(time.time())}
+            if direction == "إرسال" and filename in self.sources: entry["source"] = self.sources[filename]
+            self.history.append(entry); save_history(self.history)
+        if hasattr(self, "tray"): self.tray.setToolTip(f"SatLink · {filename[:50]} · {percent}% · {state_text(state)}")
         self._update_home_status()
     def _load_history_rows(self):
         for entry in self.history:
             table = self.sent_table if entry.get("dir") == "إرسال" else self.received_table
-            table.update_row(entry.get("name", ""), entry.get("percent", 100), "", "", entry.get("state", "مكتمل"))
+            source = entry.get("source")
+            if source: self.sources.setdefault(entry.get("name", ""), source)
+            resumable = bool(source) and entry.get("state") in RESUMABLE_STATES
+            table.update_row(entry.get("name", ""), entry.get("percent", 100), "", "", entry.get("state", "مكتمل"), entry.get("time"), resumable)
     def clear_history(self, direction):
         self.history = [h for h in self.history if h.get("dir") != direction]; save_history(self.history)
         table = self.sent_table if direction == "إرسال" else self.received_table
         for row in range(table.rowCount() - 1, -1, -1):
             item = table.item(row, 4)
-            if item and item.text() in FINAL_STATES: table.removeRow(row)
-        # Rebuild the lookup from the rows that are still running (row 0 is the newest).
+            if item and item.data(Qt.UserRole) in FINAL_STATES: table.removeRow(row)
         table.rows = {}
         for row in range(table.rowCount() - 1, -1, -1):
             name = table.item(row, 0)
@@ -1412,64 +1710,85 @@ class MainWindow(QMainWindow):
     def add_log(self, message):
         target = self.send_status if self.stack.currentIndex() == 1 else self.status_line
         if message.startswith("مكان الحفظ غير متوفر"):
-            self.status_line.setText(message)
+            self.status_line.setText(tr(message, "Save location unavailable; reconnect the drive or choose another."))
         elif any(word in message for word in ("فشل", "تعذر", "خطأ", "انقطع")):
-            target.setText("تعذر إكمال العملية. تحقق من اتصال الجهازين وأعد الإرسال ليكمل من آخر نقطة.")
+            target.setText(tr("انقطع الاتصال. يكمل تلقائياً، أو اضغط «أكمل» ليكمل من آخر نقطة.", "Connection lost. It retries automatically, or press Resume."))
+        elif "رفض" in message:
+            target.setText(tr("رفض الجهاز الآخر الاستلام", "The other device declined"))
+        elif "رمز التحقق" in message:
+            target.setText(tr(message, "Verification code " + message.split()[2] + " · check it matches the other device") if len(message.split()) > 2 else message)
         elif any(word in message for word in ("اكتمل", "تم حفظ", "تم قبول", "بدأ", "إلغاء")):
-            target.setText(message.split(" | ")[0][:160])
+            target.setText(message.split(" | ")[0][:160] if not LANG_EN else "")
 
     def _apply_style(self):
+        light = ui_setting("light", False)
         bg = asset_path("bg_neon.jpg").as_posix()
-        self.setStyleSheet("""
-            QWidget { background: transparent; color: #f4f6ff; font-family: 'Segoe UI', 'Tahoma'; font-size: 14px; }
-            #Root { background-color: #04050a; border-image: url('%s') 0 0 0 0 stretch stretch; }
-            QStackedWidget > QWidget { background: transparent; }
-            #HomeTitle { font-size: 34px; font-weight: 900; color: #ffffff; }
-            #Developer { color: #00dcff; font-weight: 700; }
-            #PageTitle { font-size: 28px; font-weight: 900; color: #ffffff; }
-            #Muted { color: #a5acc8; }
-            #StateOn { color: #50ff8c; font-size: 20px; font-weight: 900; }
-            #StateOff { color: #ff5a6e; font-size: 20px; font-weight: 900; }
-            #ImageButton { background: transparent; border: none; border-radius: 26px; }
-            #ImageButton:hover { background: rgba(120, 90, 255, 0.10); }
-            #ImageButton:pressed { background: rgba(0, 220, 255, 0.16); }
-            #BigButton { font-size: 30px; font-weight: 900; border-radius: 26px; border: 2px solid #9646ff; background: rgba(10,12,22,0.85); }
-            #Panel { background: rgba(10, 12, 22, 0.86); border-width: 2px; border-style: solid; border-color: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #ff40c8, stop:0.35 #9646ff, stop:0.65 #00dcff, stop:1 #50ff78); border-radius: 18px; }
-            #Panel QLabel, #Panel QCheckBox { background: transparent; }
-            #PanelTitle { font-size: 18px; font-weight: 900; color: #ffffff; }
-            QPushButton { background: rgba(14, 16, 30, 0.95); color: #ffffff; border-width: 2px; border-style: solid; border-color: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #9646ff, stop:1 #00dcff); border-radius: 14px; padding: 9px 16px; font-weight: 800; }
-            QPushButton:hover { background: rgba(60, 40, 140, 0.55); }
-            QPushButton:pressed { background: rgba(0, 160, 220, 0.45); }
-            #Danger { border-color: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #ff3c5a, stop:1 #ff2896); color: #ff8fa0; }
-            #Ghost { border: 1px solid #3a3f5c; color: #a5acc8; }
-            #BackButton { border: none; background: transparent; font-size: 18px; color: #00dcff; }
-            QLineEdit { background: rgba(6,8,16,0.9); border: 1px solid #3a3f5c; border-radius: 12px; padding: 8px; color: #ffffff; }
-            QListWidget { background: rgba(6,8,16,0.75); border: 1px solid #2c2f48; border-radius: 14px; padding: 6px; }
-            QListWidget::item { padding: 8px; margin: 3px; border-radius: 12px; border: 1px solid #3b2f7a; background: rgba(20,22,40,0.9); }
-            QListWidget::item:hover { border: 1px solid #00dcff; }
-            QListWidget::item:selected { background: rgba(150,70,255,0.35); color: #ffffff; }
-            QTableWidget { background: rgba(6,8,16,0.75); border: none; border-radius: 12px; gridline-color: transparent; }
-            QTableWidget::item { padding: 4px; border-bottom: 1px solid #1d2036; }
-            QHeaderView::section { background: rgba(20,22,40,0.95); color: #a5acc8; border: none; padding: 6px; font-weight: 800; }
-            QProgressBar { background: #151827; border: none; border-radius: 7px; text-align: center; color: #ffffff; font-weight: 800; min-height: 14px; max-height: 18px; }
-            QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #9646ff, stop:0.5 #00dcff, stop:1 #50ff78); border-radius: 7px; }
-            QCheckBox { color: #d0d4ec; }
-            QMenu, QMessageBox, QToolTip { background: #10121e; color: #ffffff; border: 1px solid #3b2f7a; }
-            QMenu::item { padding: 6px 18px; } QMenu::item:selected { background: #3b2f7a; }
-            QScrollBar:vertical { background: transparent; width: 10px; } QScrollBar::handle:vertical { background: #3b2f7a; border-radius: 5px; }
-        """ % bg)
+        c = {"bg": "#eef1f8", "text": "#141623", "muted": "#5f6682", "panel": "rgba(255,255,255,0.94)", "field": "#ffffff",
+             "item": "#f3f5fb", "line": "#d4d8e6", "header": "#e4e8f2", "image": "none"} if light else \
+            {"bg": "#04050a", "text": "#f4f6ff", "muted": "#a5acc8", "panel": "rgba(10,12,22,0.86)", "field": "rgba(6,8,16,0.9)",
+             "item": "rgba(20,22,40,0.9)", "line": "#2c2f48", "header": "rgba(20,22,40,0.95)", "image": f"url('{bg}')"}
+        border_image = "" if light else f"border-image: {c['image']} 0 0 0 0 stretch stretch;"
+        self.setStyleSheet(f"""
+            QWidget {{ background: transparent; color: {c['text']}; font-family: 'Segoe UI', 'Tahoma'; font-size: 14px; }}
+            #Root {{ background-color: {c['bg']}; {border_image} }}
+            #HomeTitle {{ font-size: 34px; font-weight: 900; }}
+            #Developer {{ color: #00b8e6; font-weight: 700; }}
+            #PageTitle {{ font-size: 28px; font-weight: 900; }}
+            #Muted {{ color: {c['muted']}; }}
+            #StateOn {{ color: #2fd27a; font-size: 20px; font-weight: 900; }}
+            #StateOff {{ color: #ff5a6e; font-size: 20px; font-weight: 900; }}
+            #ImageButton {{ background: transparent; border: none; border-radius: 26px; }}
+            #ImageButton:hover {{ background: rgba(120, 90, 255, 0.10); }}
+            #ImageButton:pressed {{ background: rgba(0, 220, 255, 0.16); }}
+            #BigButton {{ font-size: 30px; font-weight: 900; border-radius: 26px; border: 2px solid #9646ff; background: {c['panel']}; }}
+            #Panel {{ background: {c['panel']}; border-width: 2px; border-style: solid; border-color: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #ff40c8, stop:0.35 #9646ff, stop:0.65 #00dcff, stop:1 #50ff78); border-radius: 18px; }}
+            #Panel QLabel, #Panel QCheckBox {{ background: transparent; }}
+            #PanelTitle {{ font-size: 18px; font-weight: 900; }}
+            QPushButton {{ background: {c['field']}; color: {c['text']}; border-width: 2px; border-style: solid; border-color: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #9646ff, stop:1 #00dcff); border-radius: 14px; padding: 9px 16px; font-weight: 800; }}
+            QPushButton:hover {{ background: rgba(120, 80, 255, 0.25); }}
+            QPushButton:pressed {{ background: rgba(0, 160, 220, 0.35); }}
+            #Danger {{ border-color: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #ff3c5a, stop:1 #ff2896); color: #ff6f85; }}
+            #Ghost {{ border: 1px solid {c['line']}; color: {c['muted']}; }}
+            #Small {{ padding: 2px 8px; border-radius: 10px; font-size: 12px; }}
+            #BackButton {{ border: none; background: transparent; font-size: 18px; color: #00b8e6; }}
+            QLineEdit {{ background: {c['field']}; border: 1px solid {c['line']}; border-radius: 12px; padding: 8px; }}
+            QListWidget {{ background: {c['field']}; border: 1px solid {c['line']}; border-radius: 14px; padding: 6px; }}
+            QListWidget::item {{ padding: 8px; margin: 3px; border-radius: 12px; border: 1px solid #6a55d8; background: {c['item']}; }}
+            QListWidget::item:hover {{ border: 1px solid #00dcff; }}
+            QListWidget::item:selected {{ background: rgba(150,70,255,0.35); }}
+            QTableWidget {{ background: {c['field']}; border: none; border-radius: 12px; gridline-color: transparent; }}
+            QTableWidget::item {{ padding: 4px; border-bottom: 1px solid {c['line']}; }}
+            QHeaderView::section {{ background: {c['header']}; color: {c['muted']}; border: none; padding: 6px; font-weight: 800; }}
+            QProgressBar {{ background: {c['line']}; border: none; border-radius: 7px; text-align: center; font-weight: 800; min-height: 14px; max-height: 18px; }}
+            QProgressBar::chunk {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #9646ff, stop:0.5 #00dcff, stop:1 #50ff78); border-radius: 7px; }}
+            QMenu, QMessageBox, QToolTip {{ background: {c['bg'] if light else '#10121e'}; color: {c['text']}; border: 1px solid #6a55d8; }}
+            QMenu::item {{ padding: 6px 18px; }} QMenu::item:selected {{ background: #6a55d8; color: white; }}
+            QScrollBar:vertical {{ background: transparent; width: 10px; }} QScrollBar::handle:vertical {{ background: #6a55d8; border-radius: 5px; }}
+        """)
 
 def main():
-    app = QApplication(sys.argv); app.setQuitOnLastWindowClosed(False); app.setLayoutDirection(Qt.RightToLeft)
+    global LANG_EN
+    LANG_EN = ui_setting("lang", "ar") == "en"
+    args = sys.argv[1:]
+    paths = [a for a in args[args.index("--send") + 1:] if not a.startswith("--")] if "--send" in args else []
+    instance = acquire_instance_socket()
+    if instance is None:
+        # Already running: hand over the files (Explorer starts one process per selected file).
+        for _ in range(20):
+            if forward_to_running_instance(paths): return
+            time.sleep(0.25)
+    app = QApplication(sys.argv); app.setQuitOnLastWindowClosed(False)
+    app.setLayoutDirection(Qt.LeftToRight if LANG_EN else Qt.RightToLeft)
     icon = asset_path("satlink_share_pc_icon.ico")
     if icon.exists(): app.setWindowIcon(QIcon(str(icon)))
     w = MainWindow()
-    if "--tray" in sys.argv[1:]:
+    if instance is not None: start_control_server(w.bus, instance)
+    if "--tray" in args:
         w.receiver.start()
         # On slow logins Explorer's tray may appear after this process starts.
-        # Show the window only if the tray never becomes available.
         QTimer.singleShot(8000, lambda: w.show() if not QSystemTrayIcon.isSystemTrayAvailable() else None)
     else:
         w.show()
+        if paths: QTimer.singleShot(200, lambda: w.select_paths(paths))
     sys.exit(app.exec() if QT_BINDING == "PySide6" else app.exec_())
 if __name__ == "__main__": main()

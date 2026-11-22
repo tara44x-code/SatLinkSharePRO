@@ -1,4 +1,4 @@
-SatLink Share PRO PC 4.0 — المطور: مهند سات لنك
+SatLink Share PRO PC 5.0 — المطور: مهند سات لنك
 
 افتح README.md في جذر المشروع للتعليمات الكاملة.
 run.bat للتشغيل من المصدر، build.bat لبناء EXE (x64 و x32 حسب نسخ Python المثبتة).
