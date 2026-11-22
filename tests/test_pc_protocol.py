@@ -45,6 +45,13 @@ class Bus:
     def __init__(self):
         self.log = Event(); self.progress = Event(); self.devices = Event(); self.receiving_state = Event(); self.transfer = Event()
 
+try:
+    import cryptography  # noqa: F401
+    HAVE_CRYPTO = True
+except ImportError:
+    HAVE_CRYPTO = False
+needs_crypto = unittest.skipUnless(HAVE_CRYPTO, "encryption tests need the 'cryptography' package")
+
 class ProtocolTests(unittest.TestCase):
     def test_drive_disconnect_rejects_new_transfer(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -395,6 +402,7 @@ class ProtocolTests(unittest.TestCase):
             finally:
                 proxy.close(); receiver.stop()
 
+    @needs_crypto
     def test_encrypted_transfer_and_matching_code(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); save = root / "save"; save.mkdir()
@@ -412,6 +420,7 @@ class ProtocolTests(unittest.TestCase):
             finally:
                 receiver.stop()
 
+    @needs_crypto
     def test_reject_and_trusted_device(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); save = root / "save"; save.mkdir()
@@ -433,6 +442,7 @@ class ProtocolTests(unittest.TestCase):
                 finally:
                     receiver.stop(); satlink._identity.clear()
 
+    @needs_crypto
     def test_parallel_big_file_with_drop(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); save = root / "save"; save.mkdir()
