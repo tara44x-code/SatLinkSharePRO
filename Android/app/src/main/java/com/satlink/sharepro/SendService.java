@@ -27,6 +27,8 @@ public class SendService extends Service implements SenderClient.Listener {
 
     public interface UiListener {
         void onSendStatus(String status, boolean busy);
+        /** رمز التحقق: يجب أن يطابق الرمز الظاهر على جهاز الاستلام. */
+        void onVerifyCode(String peer, String code);
     }
 
     private static final class Job {
@@ -75,6 +77,7 @@ public class SendService extends Service implements SenderClient.Listener {
 
     @Override public void onCreate() {
         super.onCreate();
+        L.init(this);
         instance = this;
         client = new SenderClient(this, this);
         locks = new TransferLocks(this, "send");
@@ -132,6 +135,13 @@ public class SendService extends Service implements SenderClient.Listener {
         update("جاري الاتصال بـ " + target.name, 0);
     }
 
+    @Override public void onVerifyCode(String batch, String code) {
+        update(L.t("رمز التحقق ", "Verification code ") + code + L.t(" · بانتظار موافقة ", " · waiting for ") + batchPeer, 0);
+        UiListener l = uiListener.get();
+        final String peer = batchPeer;
+        if (l != null) main.post(() -> l.onVerifyCode(peer, code));
+    }
+
     @Override public void onFileStarted(String batch, String name, long size, long resumeFrom) {
         TransferLog.progress(this, TransferLog.SEND, batch, name, resumeFrom, size, 0);
     }
@@ -147,8 +157,9 @@ public class SendService extends Service implements SenderClient.Listener {
     }
 
     @Override public void onBatchEnded(String batch, boolean completed, boolean cancelled, String error) {
+        boolean rejected = error != null && error.contains("رفض");
         TransferLog.endSession(this, TransferLog.SEND, batch,
-                cancelled ? TransferLog.STATE_CANCELLED : TransferLog.STATE_FAILED);
+                cancelled ? TransferLog.STATE_CANCELLED : rejected ? TransferLog.STATE_REJECTED : TransferLog.STATE_FAILED);
         String text = completed ? "اكتمل الإرسال إلى " + batchPeer
                 : cancelled ? "تم إلغاء الإرسال"
                 : "تعذر الإرسال" + (error == null ? "" : ": " + error) + " · أعد الإرسال ليكمل من آخر نقطة";

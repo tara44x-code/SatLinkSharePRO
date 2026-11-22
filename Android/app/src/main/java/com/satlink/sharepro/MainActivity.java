@@ -100,6 +100,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        L.init(this);
         nsdHelper = new SatLinkNsdHelper(this);
         udpHelper = new UdpDiscoveryHelper(this);
         vnet = new VirtualNetwork(this);
@@ -145,7 +146,12 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         if (intent == null) return false;
         String target = intent.getStringExtra(EXTRA_SCREEN);
         if ("send".equals(target)) { showSend(); return true; }
-        if ("receive".equals(target)) { showReceive(); return true; }
+        if ("receive".equals(target)) {
+            showReceive();
+            ReceiverServer.Request pendingRequest = ReceiveService.pendingRequest(intent.getStringExtra(ReceiveService.EXTRA_REQUEST));
+            if (pendingRequest != null) onIncomingRequest(pendingRequest);
+            return true;
+        }
         String action = intent.getAction();
         if (!Intent.ACTION_SEND.equals(action) && !Intent.ACTION_SEND_MULTIPLE.equals(action)) return false;
         ArrayList<Uri> uris = new ArrayList<>();
@@ -557,7 +563,55 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         return true;
     }
 
+    // ------------------------------------------------------------------- الموافقة ورمز التحقق
+
+    private AlertDialog requestDialog;
+    private String requestDialogId;
+
+    @Override public void onIncomingRequest(ReceiverServer.Request r) {
+        if (r == null || r.id.equals(requestDialogId)) return;
+        if (requestDialog != null) try { requestDialog.dismiss(); } catch (Exception ignored) {}
+        requestDialogId = r.id;
+        StringBuilder msg = new StringBuilder();
+        msg.append(r.count).append(L.t(" ملف · ", " files · ")).append(NetworkUtils.formatBytes(r.total));
+        for (String f : r.files) msg.append("\n• ").append(f);
+        if (r.count > r.files.size()) msg.append("\n…");
+        if (r.code != null) msg.append("\n\n").append(L.t("رمز التحقق: ", "Verification code: ")).append(r.code)
+                .append(L.t("\nتأكد أنه نفس الرمز الظاهر على الجهاز المرسل.", "\nMake sure the sender shows the same code."));
+        else msg.append("\n\n").append(L.t("⚠ الجهاز المرسل بنسخة قديمة (بدون تشفير).", "⚠ The sender uses an old version (not encrypted)."));
+        requestDialog = new AlertDialog.Builder(this)
+                .setTitle(L.t("طلب استلام من ", "Files from ") + r.sender)
+                .setMessage(msg.toString())
+                .setPositiveButton(L.t("قبول", "Accept"), (d, w) -> ReceiveService.decide(r.id, ReceiverServer.DECISION_ACCEPT))
+                .setNeutralButton(L.t("قبول دائماً", "Always accept"), (d, w) -> ReceiveService.decide(r.id, r.legacy ? ReceiverServer.DECISION_ACCEPT : ReceiverServer.DECISION_TRUST))
+                .setNegativeButton(L.t("رفض", "Decline"), (d, w) -> ReceiveService.decide(r.id, ReceiverServer.DECISION_REJECT))
+                .setCancelable(false)
+                .create();
+        requestDialog.setOnDismissListener(d -> requestDialogId = null);
+        requestDialog.show();
+    }
+
+    private AlertDialog codeDialog;
+
+    @Override public void onVerifyCode(String peer, String code) {
+        if (codeDialog != null) try { codeDialog.dismiss(); } catch (Exception ignored) {}
+        TextView big = text(code, 44, CYAN, true);
+        big.setGravity(Gravity.CENTER);
+        big.setLetterSpacing(0.3f);
+        big.setPadding(0, dp(16), 0, dp(8));
+        codeDialog = new AlertDialog.Builder(this)
+                .setTitle(L.t("بانتظار موافقة ", "Waiting for ") + peer)
+                .setMessage(L.t("تأكد أن نفس الرمز ظاهر على جهاز الاستلام، ثم وافق هناك.", "Check that the receiving device shows the same code, then accept there."))
+                .setView(big)
+                .setPositiveButton(L.t("تمام", "OK"), null)
+                .create();
+        codeDialog.show();
+    }
+
     @Override public void onSendStatus(String status, boolean busy) {
+        if (codeDialog != null && codeDialog.isShowing() && status != null && !status.contains(L.t("رمز التحقق", "Verification code"))) {
+            try { codeDialog.dismiss(); } catch (Exception ignored) {}
+        }
         if (sendStatusText != null) sendStatusText.setText(status == null ? "" : status);
         if (cancelSendButton != null) cancelSendButton.setVisibility(busy ? View.VISIBLE : View.GONE);
     }

@@ -284,9 +284,11 @@ class ProtocolTests(unittest.TestCase):
             port = self._free_port(); saved = threading.Event(); events = []
             server = socket.socket(); server.bind(("127.0.0.1", port)); server.listen(1)
             def slow_receiver():
-                conn, _ = server.accept()
+                while True:
+                    conn, _ = server.accept()
+                    if satlink.read_utf(conn) == satlink.ACK_PROTOCOL: break
+                    conn.close()  # behaves like an older receiver for the encrypted V6 header
                 with conn:
-                    self.assertEqual(satlink.read_utf(conn), satlink.ACK_PROTOCOL)
                     satlink.read_utf(conn); satlink.read_int(conn); satlink.read_long(conn)
                     satlink.write_bool(conn, True)
                     satlink.read_utf(conn); size = satlink.read_long(conn); satlink.write_long(conn, 0)
@@ -310,9 +312,9 @@ class ProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); source = root / "video.mp4"; source.write_bytes(b"V" * 5000)
             port = self._free_port(); got = {}
-            server = socket.socket(); server.bind(("127.0.0.1", port)); server.listen(2)
+            server = socket.socket(); server.bind(("127.0.0.1", port)); server.listen(4)
             def old_receiver():
-                for _ in range(2):
+                for _ in range(3):
                     conn, _ = server.accept()
                     with conn:
                         header = satlink.read_utf(conn)
@@ -329,37 +331,142 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(got.get("video.mp4"), source.read_bytes())
             self.assertFalse(any("فشل الإرسال" in m for m in bus.log.values))
 
+    def _proxy(self, target_port, cut_after):
+        """TCP proxy; the first connection is cut after cut_after bytes from the sender."""
+        srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0)); srv.listen(16); state = {"first": True, "cut": False}
+        def pipe(a, b, limit):
+            n = 0
+            try:
+                while True:
+                    d = a.recv(65536)
+                    if not d: break
+                    if limit is not None and n + len(d) > limit:
+                        b.sendall(d[:limit - n]); state["cut"] = True; break
+                    b.sendall(d); n += len(d)
+            except OSError: pass
+            for x in (a, b):
+                try: x.shutdown(socket.SHUT_RDWR)
+                except OSError: pass
+        def loop():
+            while True:
+                try: client, _ = srv.accept()
+                except OSError: return
+                upstream = socket.create_connection(("127.0.0.1", target_port))
+                limit = cut_after if state["first"] else None; state["first"] = False
+                threading.Thread(target=pipe, args=(client, upstream, limit), daemon=True).start()
+                threading.Thread(target=pipe, args=(upstream, client, None), daemon=True).start()
+        threading.Thread(target=loop, daemon=True).start()
+        return srv, state
+
+    def _start_receiver(self, save, decide=None):
+        satlink.downloads_received_dir = lambda: save
+        satlink.ANDROID_TCP_PORT = self._free_port()
+        bus = Bus(); receiver = satlink.ReceiverServer(bus); receiver.decide = decide; receiver.start()
+        time.sleep(0.15)
+        return receiver, bus
+
+    def _make_files(self, root, sizes):
+        out = []
+        for name, size in sizes:
+            p = root / name; p.write_bytes(os.urandom(size)); out.append(p)
+        return out
+
+    def _assert_saved(self, save, sources):
+        for p in sources: self._wait_for(lambda p=p: (save / p.name).exists())
+        self.assertEqual(sorted(x.name for x in save.iterdir() if x.is_file()), sorted(p.name for p in sources))
+        for p in sources: self.assertEqual((save / p.name).read_bytes(), p.read_bytes())
+
     def test_multi_file_batch_resumes_after_drop(self):
         """Video + app + game: the connection drops in the middle of the 2nd file and
         the sender reconnects, skips the confirmed file and finishes the rest."""
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); save = root / "save"; save.mkdir()
-            sources = []
-            for name, size in (("film.mp4", 900000), ("app.apk", 700000), ("game.obb", 400000)):
-                p = root / name; p.write_bytes(os.urandom(size)); sources.append(p)
-            satlink.downloads_received_dir = lambda: save
-            satlink.ANDROID_TCP_PORT = self._free_port()
-            receiver = satlink.ReceiverServer(Bus()); receiver.start()
-            dropped = {"done": False}; sent = {}
-            real_sendall = socket.socket.sendall
-            def flaky_sendall(sock, data, *args):
-                real_sendall(sock, data, *args)
-                if sock.getsockname()[1] == satlink.ANDROID_TCP_PORT: return  # receiver side
-                total = sent.get(id(sock), 0) + len(data); sent[id(sock)] = total
-                if not dropped["done"] and total > 900000 + 300000:
-                    dropped["done"] = True
-                    sock.shutdown(socket.SHUT_RDWR); raise ConnectionResetError("simulated drop")
+            sources = self._make_files(root, (("film.mp4", 900000), ("app.apk", 700000), ("game.obb", 400000)))
+            receiver, _ = self._start_receiver(save)
+            proxy, state = self._proxy(satlink.ANDROID_TCP_PORT, 900000 + 300000)
             try:
-                time.sleep(0.15)
                 bus = Bus()
-                with patch.object(socket.socket, "sendall", flaky_sendall), patch.object(satlink.time, "sleep", lambda *_: None):
-                    satlink.Sender(bus)._send_android_protocol("127.0.0.1", satlink.ANDROID_TCP_PORT, [str(p) for p in sources])
-                self.assertTrue(dropped["done"])
-                for p in sources:
-                    self._wait_for(lambda p=p: (save / p.name).exists())
-                    self.assertEqual((save / p.name).read_bytes(), p.read_bytes())
-                self.assertEqual(sorted(x.name for x in save.iterdir() if x.is_file()), sorted(p.name for p in sources), bus.log.values)
+                with patch.object(satlink.time, "sleep", lambda *_: None):
+                    satlink.Sender(bus)._send_android_protocol("127.0.0.1", proxy.getsockname()[1], [str(p) for p in sources])
+                self.assertTrue(state["cut"])
+                self._assert_saved(save, sources)
                 self.assertTrue(any("إعادة المحاولة" in m for m in bus.log.values))
+            finally:
+                proxy.close(); receiver.stop()
+
+    def test_encrypted_transfer_and_matching_code(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); save = root / "save"; save.mkdir()
+            sources = self._make_files(root, (("a.bin", 5000), ("b.bin", 0), ("c.bin", 70000)))
+            seen = []
+            receiver, _ = self._start_receiver(save, lambda req: seen.append(req) or satlink.DECISION_ACCEPT)
+            try:
+                bus = Bus(); bus.verify = Event()
+                satlink.Sender(bus)._send_android_protocol("127.0.0.1", satlink.ANDROID_TCP_PORT, [str(p) for p in sources])
+                self._assert_saved(save, sources)
+                self.assertEqual(len(seen), 1)
+                self.assertFalse(seen[0]["legacy"])
+                self.assertRegex(seen[0]["code"], r"^\d{4}$")
+                self.assertEqual(bus.verify.values[-1][1], seen[0]["code"])
+            finally:
+                receiver.stop()
+
+    def test_reject_and_trusted_device(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); save = root / "save"; save.mkdir()
+            with patch.object(satlink, "settings_path", return_value=root / "cfg" / "settings.json"):
+                satlink._identity.clear()
+                a, = self._make_files(root, (("one.bin", 1000),))
+                answers = [satlink.DECISION_REJECT, satlink.DECISION_TRUST]; asked = []
+                receiver, _ = self._start_receiver(save, lambda req: asked.append(req) or answers.pop(0))
+                try:
+                    bus = Bus(); satlink.Sender(bus)._send_android_protocol("127.0.0.1", satlink.ANDROID_TCP_PORT, [str(a)])
+                    self.assertTrue(any("رفض" in m for m in bus.log.values)); self.assertFalse((save / "one.bin").exists())
+                    satlink.Sender(Bus())._send_android_protocol("127.0.0.1", satlink.ANDROID_TCP_PORT, [str(a)])
+                    self._wait_for(lambda: (save / "one.bin").exists())
+                    self.assertEqual(len(satlink.trusted_devices()), 1)
+                    # third time: trusted, no question asked
+                    satlink.Sender(Bus())._send_android_protocol("127.0.0.1", satlink.ANDROID_TCP_PORT, [str(a)])
+                    self._wait_for(lambda: (save / "one_1.bin").exists())
+                    self.assertEqual(len(asked), 2)
+                finally:
+                    receiver.stop(); satlink._identity.clear()
+
+    def test_parallel_big_file_with_drop(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); save = root / "save"; save.mkdir()
+            sources = self._make_files(root, (("small.txt", 3000), ("movie.mkv", 3_000_000), ("tail.bin", 9000)))
+            receiver, _ = self._start_receiver(save)
+            try:
+                with patch.object(satlink, "PARALLEL_MIN", 1_000_000):
+                    bus = Bus(); satlink.Sender(bus)._send_android_protocol("127.0.0.1", satlink.ANDROID_TCP_PORT, [str(p) for p in sources])
+                    self._assert_saved(save, sources)
+                    self.assertFalse(any("فشل" in m for m in bus.log.values))
+                    # now cut one range connection mid-way: must resume and still be identical
+                    for p in sources: (save / p.name).unlink()
+                    receiver.recent.clear()
+                    proxy, state = self._proxy(satlink.ANDROID_TCP_PORT, 3000 + 600)  # the main stream survives; first conn is main
+                    proxy.close()
+                    real_open = satlink.Sender._open_tls; calls = {"n": 0}
+                    def flaky_open(sender, host, port, header):
+                        s = real_open(sender, host, port, header)
+                        if header == satlink.RANGE_PROTOCOL:
+                            calls["n"] += 1
+                            if calls["n"] == 2:
+                                real_sendall = s.sendall; sent = {"n": 0}
+                                def cut(data, *args):
+                                    sent["n"] += len(data)
+                                    if sent["n"] > 400_000: s.shutdown(socket.SHUT_RDWR); raise ConnectionResetError("cut")
+                                    return real_sendall(data, *args)
+                                s.sendall = cut
+                        return s
+                    bus2 = Bus()
+                    with patch.object(satlink.Sender, "_open_tls", flaky_open), patch.object(satlink.time, "sleep", lambda *_: None):
+                        satlink.Sender(bus2)._send_android_protocol("127.0.0.1", satlink.ANDROID_TCP_PORT, [str(p) for p in sources])
+                    self.assertTrue(any("إعادة المحاولة" in m for m in bus2.log.values), bus2.log.values)
+                    self._assert_saved(save, sources)
+                    self.assertFalse(list(save.glob(".satlink_parts/*.json")))
             finally:
                 receiver.stop()
 

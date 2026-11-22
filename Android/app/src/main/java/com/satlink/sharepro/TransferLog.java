@@ -27,6 +27,7 @@ public final class TransferLog {
     public static final String STATE_CANCELLED = "cancelled";
     public static final String STATE_FAILED = "failed";
     public static final String STATE_PAUSED = "paused";
+    public static final String STATE_REJECTED = "rejected";
 
     private static final int MAX_ENTRIES = 300;
     private static final String PREFS = "satlink_transfer_log";

@@ -23,11 +23,18 @@ public class ReceiveService extends Service implements ReceiverServer.Listener {
     public static final String ACTION_STOP = "com.satlink.sharepro.STOP_RECEIVING";
     public static final String ACTION_VNET_ON = "com.satlink.sharepro.VNET_ON";
     public static final String ACTION_VNET_OFF = "com.satlink.sharepro.VNET_OFF";
+    public static final String ACTION_DECIDE = "com.satlink.sharepro.DECIDE";
+    public static final String EXTRA_REQUEST = "request";
+    public static final String EXTRA_DECISION = "decision";
     private static final String CHANNEL = "satlink_receiving";
+    private static final String REQUEST_CHANNEL = "satlink_requests";
+    private static final int REQUEST_TIMEOUT_MS = 60000;
     private static final int NOTIFICATION_ID = 8988;
 
     public interface UiListener {
         void onReceiveStatus(String status);
+        /** طلب استلام من جهاز جديد: الواجهة تعرض نافذة قبول/رفض وتستدعي decide(). */
+        void onIncomingRequest(ReceiverServer.Request request);
         void onVirtualNetwork(boolean on, String ssid, String passphrase, String ip, String message);
     }
 
@@ -93,6 +100,7 @@ public class ReceiveService extends Service implements ReceiverServer.Listener {
 
     @Override public void onCreate() {
         super.onCreate();
+        L.init(this);
         instance = this;
         receiver = new ReceiverServer(this, this);
         nsd = new SatLinkNsdHelper(this);
@@ -104,11 +112,96 @@ public class ReceiveService extends Service implements ReceiverServer.Listener {
             NotificationChannel channel = new NotificationChannel(CHANNEL, "استلام SatLink", NotificationManager.IMPORTANCE_LOW);
             channel.setDescription("استلام الملفات من الأجهزة القريبة");
             notifications.createNotificationChannel(channel);
+            NotificationChannel req = new NotificationChannel(REQUEST_CHANNEL, L.t("طلبات الاستلام", "Incoming requests"), NotificationManager.IMPORTANCE_HIGH);
+            req.setDescription(L.t("موافقة على الاستلام من جهاز جديد", "Approve files from a new device"));
+            notifications.createNotificationChannel(req);
         }
+    }
+
+    // ---------------------------------------------------------------- طلبات الاستلام
+
+    private static final class Pending {
+        final ReceiverServer.Request request;
+        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        volatile int decision = ReceiverServer.DECISION_REJECT;
+        Pending(ReceiverServer.Request r) { request = r; }
+    }
+
+    private static final ConcurrentHashMap<String, Pending> pending = new ConcurrentHashMap<>();
+
+    public static boolean askBeforeReceiving(Context c) {
+        return prefs(c).getBoolean("ask_unknown", true);
+    }
+
+    public static void setAskBeforeReceiving(Context c, boolean value) {
+        prefs(c).edit().putBoolean("ask_unknown", value).apply();
+    }
+
+    /** قرار المستخدم من النافذة أو من أزرار الإشعار. */
+    public static void decide(String requestId, int decision) {
+        Pending p = pending.get(requestId);
+        if (p == null) return;
+        p.decision = decision;
+        p.latch.countDown();
+    }
+
+    public static ReceiverServer.Request pendingRequest(String id) {
+        Pending p = id == null ? null : pending.get(id);
+        return p == null ? null : p.request;
+    }
+
+    @Override public int onIncoming(ReceiverServer.Request request) {
+        if (!askBeforeReceiving(this)) return ReceiverServer.DECISION_ACCEPT;
+        Pending p = new Pending(request);
+        pending.put(request.id, p);
+        int notificationId = 9000 + (request.id.hashCode() & 0x3ff);
+        try {
+            showRequestNotification(request, notificationId);
+            UiListener l = uiListener.get();
+            if (l != null) main.post(() -> l.onIncomingRequest(request));
+            p.latch.await(REQUEST_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+            return p.decision;
+        } catch (InterruptedException e) {
+            return ReceiverServer.DECISION_REJECT;
+        } finally {
+            pending.remove(request.id);
+            if (notifications != null) notifications.cancel(notificationId);
+        }
+    }
+
+    private PendingIntent decisionIntent(String id, int decision, int code) {
+        Intent i = new Intent(this, ReceiveService.class).setAction(ACTION_DECIDE)
+                .putExtra(EXTRA_REQUEST, id).putExtra(EXTRA_DECISION, decision);
+        return PendingIntent.getService(this, code, i, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+    }
+
+    private void showRequestNotification(ReceiverServer.Request r, int notificationId) {
+        if (notifications == null) return;
+        Intent open = new Intent(this, MainActivity.class).putExtra(MainActivity.EXTRA_SCREEN, "receive").putExtra(EXTRA_REQUEST, r.id);
+        open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent openIntent = PendingIntent.getActivity(this, notificationId, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        String text = r.count + " " + L.t("ملف", "files") + " · " + NetworkUtils.formatBytes(r.total)
+                + (r.code != null ? " · " + L.t("الرمز ", "code ") + r.code : " · " + L.t("نسخة قديمة بدون تشفير", "old version, not encrypted"));
+        Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, REQUEST_CHANNEL) : new Notification.Builder(this);
+        b.setSmallIcon(android.R.drawable.stat_sys_download)
+                .setContentTitle(L.t("طلب استلام من ", "Files from ") + r.sender)
+                .setContentText(text)
+                .setContentIntent(openIntent)
+                .setAutoCancel(true)
+                .setPriority(Notification.PRIORITY_HIGH)
+                .setCategory(Notification.CATEGORY_CALL)
+                .addAction(android.R.drawable.ic_menu_send, L.t("قبول", "Accept"), decisionIntent(r.id, ReceiverServer.DECISION_ACCEPT, notificationId * 4 + 1))
+                .addAction(android.R.drawable.star_on, L.t("قبول دائماً", "Always"), decisionIntent(r.id, ReceiverServer.DECISION_TRUST, notificationId * 4 + 2))
+                .addAction(android.R.drawable.ic_menu_close_clear_cancel, L.t("رفض", "Decline"), decisionIntent(r.id, ReceiverServer.DECISION_REJECT, notificationId * 4 + 3));
+        try { notifications.notify(notificationId, b.build()); } catch (Exception ignored) {}
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? null : intent.getAction();
+        if (ACTION_DECIDE.equals(action)) {
+            decide(intent.getStringExtra(EXTRA_REQUEST), intent.getIntExtra(EXTRA_DECISION, ReceiverServer.DECISION_REJECT));
+            if (receiver.isRunning()) return START_STICKY;
+        }
         if (ACTION_STOP.equals(action)) {
             stopSelf();
             return START_NOT_STICKY;

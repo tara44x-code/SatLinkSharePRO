@@ -145,7 +145,51 @@ public class FileStoreUtils {
         return uri;
     }
 
+    // للملفات الكبيرة التي تصل عبر عدة اتصالات بالتوازي: آخر نقطة متصلة مكتوبة بالكامل.
+    public static long getSafeOffset(Context context, String fileName, long totalSize) {
+        return context.getSharedPreferences("satlink_safe", Context.MODE_PRIVATE).getLong(pendingKey(fileName, totalSize), -1L);
+    }
+
+    public static void setSafeOffset(Context context, String fileName, long totalSize, long offset) {
+        context.getSharedPreferences("satlink_safe", Context.MODE_PRIVATE).edit().putLong(pendingKey(fileName, totalSize), offset).apply();
+    }
+
+    public static void clearSafeOffset(Context context, String fileName, long totalSize) {
+        context.getSharedPreferences("satlink_safe", Context.MODE_PRIVATE).edit().remove(pendingKey(fileName, totalSize)).apply();
+    }
+
+    /** كتابة في أي موضع داخل الملف المؤقت (لمسارات النقل المتوازية). */
+    public interface RandomWriter extends java.io.Closeable {
+        void write(byte[] b, int off, int len, long position) throws IOException;
+    }
+
+    public static RandomWriter openPartialRandom(Context context, String fileName, long totalSize) throws IOException {
+        if (Build.VERSION.SDK_INT >= 29) {
+            Uri uri = ensurePendingUri(context, fileName, totalSize);
+            final ParcelFileDescriptor fd = context.getContentResolver().openFileDescriptor(uri, "rw");
+            if (fd == null) throw new IOException("تعذر فتح ملف التنزيلات");
+            final FileOutputStream out = new FileOutputStream(fd.getFileDescriptor());
+            final java.nio.channels.FileChannel ch = out.getChannel();
+            return new RandomWriter() {
+                @Override public void write(byte[] b, int off, int len, long position) throws IOException {
+                    java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(b, off, len);
+                    while (buf.hasRemaining()) position += ch.write(buf, position);
+                }
+                @Override public void close() throws IOException { try { out.close(); } finally { fd.close(); } }
+            };
+        }
+        final java.io.RandomAccessFile raf = new java.io.RandomAccessFile(getPartialFile(context, fileName, totalSize), "rw");
+        return new RandomWriter() {
+            @Override public synchronized void write(byte[] b, int off, int len, long position) throws IOException {
+                raf.seek(position); raf.write(b, off, len);
+            }
+            @Override public void close() throws IOException { raf.close(); }
+        };
+    }
+
     public static long getPartialSize(Context context, String fileName, long totalSize) {
+        long safe = getSafeOffset(context, fileName, totalSize);
+        if (safe >= 0 && safe <= totalSize) return safe;
         try {
             if (Build.VERSION.SDK_INT >= 29) {
                 Uri uri = pendingUri(context, fileName, totalSize);
@@ -181,11 +225,36 @@ public class FileStoreUtils {
                 };
             } catch (IOException e) { fd.close(); throw e; }
         }
-        File file = getPartialFile(context, fileName, totalSize);
-        return new FileOutputStream(file, offset > 0);
+        final java.io.RandomAccessFile raf = new java.io.RandomAccessFile(getPartialFile(context, fileName, totalSize), "rw");
+        raf.seek(offset);
+        return new OutputStream() {
+            @Override public void write(int b) throws IOException { raf.write(b); }
+            @Override public void write(byte[] b, int off, int len) throws IOException { raf.write(b, off, len); }
+            @Override public void close() throws IOException { raf.close(); }
+        };
+    }
+
+    /** يقص الملف المؤقت على حجمه الصحيح (بعد نقل متوازي قد يكون أطول من المطلوب). */
+    private static void truncatePartial(Context context, String fileName, long totalSize) {
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                Uri uri = pendingUri(context, fileName, totalSize);
+                if (uri == null) return;
+                try (ParcelFileDescriptor fd = context.getContentResolver().openFileDescriptor(uri, "rw");
+                     FileOutputStream out = new FileOutputStream(fd.getFileDescriptor())) {
+                    if (out.getChannel().size() > totalSize) out.getChannel().truncate(totalSize);
+                }
+                return;
+            }
+            File f = getPartialFile(context, fileName, totalSize);
+            if (f.exists() && f.length() > totalSize) {
+                try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "rw")) { raf.setLength(totalSize); }
+            }
+        } catch (Exception ignored) {}
     }
 
     public static void resetPartial(Context context, String fileName, long totalSize) {
+        clearSafeOffset(context, fileName, totalSize);
         try {
             if (Build.VERSION.SDK_INT >= 29) {
                 Uri uri = pendingUri(context, fileName, totalSize);
@@ -200,6 +269,8 @@ public class FileStoreUtils {
 
     /** ينقل الملف المكتمل إلى Downloads/SatLink Share PRO/Received ويرجع رابطه. */
     public static Uri copyPartialToDownloads(Context context, String fileName, long totalSize) throws IOException {
+        truncatePartial(context, fileName, totalSize);
+        clearSafeOffset(context, fileName, totalSize);
         if (Build.VERSION.SDK_INT >= 29) {
             Uri uri = pendingUri(context, fileName, totalSize);
             if (uri == null && totalSize == 0) uri = ensurePendingUri(context, fileName, totalSize);

@@ -264,6 +264,7 @@ def unique_destination(save, filename):
 class Bus(QObject):
     log = Signal(str); progress = Signal(int); devices = Signal(list); receiving_state = Signal(str)
     transfer = Signal(str, str, int, str, str, str)  # direction, filename, percent, speed, ETA, state
+    verify = Signal(str, str)  # peer name, 4-digit verification code shown while waiting for approval
 
 def transfer_eta(remaining, speed):
     if speed <= 0: return "—"
@@ -279,21 +280,141 @@ def transfer_update(bus, direction, filename, done, size, started, state, origin
                       f"{speed / 1048576:.1f} MB/s" if speed else "—",
                       transfer_eta(max(0, size - done), speed), state)
 
+# --------------------------------------------------------------------------- V6: encryption & trust
+
+def read_byte(sock): return read_exact(sock, 1)[0]
+def write_byte(sock, val): sock.sendall(bytes([int(val) & 0xff]))
+def read_blob(sock, limit=4096):
+    n = read_int(sock)
+    if not 0 <= n <= limit: raise ValueError("bad blob")
+    return read_exact(sock, n)
+def write_blob(sock, data): sock.sendall(struct.pack(">i", len(data)) + bytes(data))
+
+def verify_code(cert_der: bytes, nonce: bytes) -> str:
+    """4-digit code both sides show. The nonce is sent after the receiver committed to its
+    certificate, so a man-in-the-middle cannot pick a certificate that matches the code."""
+    return f"{int.from_bytes(hashlib.sha256(cert_der + nonce).digest()[:4], 'big') % 10000:04d}"
+
+def device_id() -> str:
+    value = load_settings().get("device_id")
+    if isinstance(value, str) and len(value) == 32: return value
+    value = os.urandom(16).hex(); save_settings({"device_id": value}); return value
+
+_trust_lock = threading.Lock()
+def trust_path() -> Path: return settings_path().parent / "trust.json"
+def load_trust() -> dict:
+    try:
+        data = json.loads(trust_path().read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            data.setdefault("trusted", {}); data.setdefault("known", {}); return data
+    except (OSError, ValueError, TypeError): pass
+    return {"trusted": {}, "known": {}}
+def save_trust(data):
+    target = trust_path(); target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+def trusted_devices():
+    with _trust_lock: return dict(load_trust()["trusted"])
+def forget_trusted(device):
+    with _trust_lock:
+        data = load_trust(); data["trusted"].pop(device, None); save_trust(data)
+
+_identity = {}
+def tls_identity():
+    """Self-signed certificate of this PC, created once (needs the 'cryptography' package)."""
+    if "der" in _identity: return _identity
+    import ssl as _ssl
+    folder = settings_path().parent / "identity"; folder.mkdir(parents=True, exist_ok=True)
+    cert, key = folder / "cert.pem", folder / "key.pem"
+    if not (cert.exists() and key.exists()):
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        import datetime
+        private = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "SatLink " + device_id())])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        certificate = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+                       .public_key(private.public_key()).serial_number(x509.random_serial_number())
+                       .not_valid_before(now - datetime.timedelta(days=1)).not_valid_after(now + datetime.timedelta(days=7300))
+                       .sign(private, hashes.SHA256()))
+        key.write_bytes(private.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+        cert.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    server = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER); server.minimum_version = _ssl.TLSVersion.TLSv1_2
+    server.load_cert_chain(str(cert), str(key))
+    _identity.update(der=_ssl.PEM_cert_to_DER_cert(cert.read_text()), server=server)
+    return _identity
+
+def encryption_available() -> bool:
+    try: tls_identity(); return True
+    except Exception: return False
+
+def client_tls_context():
+    import ssl as _ssl
+    ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT); ctx.minimum_version = _ssl.TLSVersion.TLSv1_2
+    # The receiver's certificate is self-signed: it is checked with the 4-digit code
+    # the first time and pinned by fingerprint after the user trusts the device.
+    ctx.check_hostname = False; ctx.verify_mode = _ssl.CERT_NONE
+    return ctx
+
+SECURE_PROTOCOL = "SATLINK_SHARE_PRO_V6_SECURE"
+RANGE_PROTOCOL = "SATLINK_SHARE_PRO_V6_RANGE"
+PARALLEL_MIN = 32 * 1024 * 1024   # files bigger than this go over several connections
+PARALLEL_STREAMS = 3
+DECISION_REJECT, DECISION_ACCEPT, DECISION_TRUST = 0, 1, 2
+
+def sidecar_path(part: Path) -> Path: return part.with_suffix(".json")
+def read_safe_offset(part: Path):
+    try: return int(json.loads(sidecar_path(part).read_text())["safe"])
+    except (OSError, ValueError, KeyError, TypeError): return None
+def write_safe_offset(part: Path, value: int):
+    try: sidecar_path(part).write_text(json.dumps({"safe": int(value)}))
+    except OSError: pass
+
+class _ParallelFile:
+    """Receiver-side state of one file arriving over several range connections."""
+    def __init__(self, part, size, origin, expected):
+        self.part = part; self.size = size; self.origin = origin; self.expected = expected
+        self.ranges = {}; self.lock = threading.Lock(); self.done = threading.Event(); self.failed = None
+        self.finished = 0; self.last_persist = 0
+    def safe_offset(self):
+        safe = self.origin
+        for start in sorted(self.ranges):
+            end, written = self.ranges[start]
+            if start > safe: break
+            safe = max(safe, start + written)
+            if start + written < end: break
+        return safe
+    def progress(self, start, written, final=False):
+        with self.lock:
+            self.ranges[start] = (self.ranges[start][0], written)
+            now = time.monotonic()
+            if final or now - self.last_persist > 1.0:
+                self.last_persist = now; write_safe_offset(self.part, self.safe_offset())
+    def received(self):
+        with self.lock: return self.origin + sum(w for _, w in self.ranges.values())
+
 class ReceiverServer:
     def __init__(self, bus):
         self.bus = bus; self.stop_event = threading.Event(); self.thread = None; self.udp_thread = None; self.sock = None; self.udp_sock = None
-        self.active_client = None; self.cancelled_client = None; self.active_lock = threading.Lock()
+        self.active = set(); self.cancelled = set(); self.active_lock = threading.Lock()
         # Files saved in the last minutes, so a sender that reconnects because the
         # confirmation got lost is told "already complete" instead of sending a duplicate.
         self.recent = {}; self.recent_lock = threading.Lock()
+        self.sessions = {}; self.sessions_lock = threading.Lock()
+        # decide(request) -> 0 reject / 1 accept / 2 accept and trust. None = accept everything.
+        self.decide = None
+    # compatibility with older callers
+    @property
+    def active_client(self):
+        with self.active_lock: return next(iter(self.active), None)
     def cancel_current(self):
         with self.active_lock:
-            client = self.active_client
-            self.cancelled_client = client
-        if client:
+            clients = list(self.active); self.cancelled.update(clients)
+        for client in clients:
             try: client.shutdown(socket.SHUT_RDWR)
             except OSError: pass
-            self.bus.log.emit("تم إلغاء الاستلام الحالي؛ يبقى الجزء المنقول للاستئناف")
+        if clients: self.bus.log.emit("تم إلغاء الاستلام الحالي؛ يبقى الجزء المنقول للاستئناف")
     def is_running(self):
         return bool(self.thread and self.thread.is_alive() and not self.stop_event.is_set())
     def start(self):
@@ -308,7 +429,6 @@ class ReceiverServer:
         self.udp_thread = threading.Thread(target=self._udp_responder_loop, daemon=True); self.udp_thread.start()
         self.bus.receiving_state.emit("يعمل")
         self.bus.log.emit(f"جاهز للاستقبال على {', '.join(local_ipv4_addresses()) or get_local_ip()} · المنفذ {ANDROID_TCP_PORT}")
-        self.bus.log.emit("لإظهار هذا الجهاز: افتح التطبيق أو البرنامج الآخر > إرسال > بحث عن الأجهزة")
     def stop(self):
         self.stop_event.set()
         try:
@@ -329,7 +449,7 @@ class ReceiverServer:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try: self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER)
             except OSError: pass
-            self.sock.bind(("", ANDROID_TCP_PORT)); self.sock.listen(5)
+            self.sock.bind(("", ANDROID_TCP_PORT)); self.sock.listen(16)
         except Exception as e:
             self.bus.log.emit(f"فشل تشغيل الاستقبال: {e}"); self.bus.receiving_state.emit("فشل"); return
         while not self.stop_event.is_set():
@@ -345,7 +465,6 @@ class ReceiverServer:
             self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             self.udp_sock.bind(("", ANDROID_UDP_PORT)); self.udp_sock.settimeout(1.0)
-            self.bus.log.emit("اكتشاف الأجهزة شغال: هذه الحاسبة ستظهر للموبايل والحاسبات القريبة")
         except Exception as e:
             self.bus.log.emit(f"تعذر تشغيل اكتشاف Android UDP: {e}"); return
         while not self.stop_event.is_set():
@@ -356,85 +475,250 @@ class ReceiverServer:
                     self.udp_sock.sendto(resp, (addr[0], addr[1]))
             except socket.timeout: continue
             except Exception: pass
+
+    def _ask(self, request):
+        if self.decide is None: return DECISION_ACCEPT
+        try: return int(self.decide(request))
+        except Exception: return DECISION_REJECT
+
+    def _recent_saved(self, key):
+        with self.recent_lock:
+            now = time.monotonic()
+            self.recent = {k: t for k, t in self.recent.items() if now - t < 900}
+            return key in self.recent
+    def _remember_saved(self, key):
+        with self.recent_lock: self.recent[key] = time.monotonic()
+
+    def _finalize(self, save, relative, part, size):
+        with open(part, "r+b" if part.exists() else "wb") as f: f.truncate(size)
+        destination_dir = save / relative.parent
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        out_path = unique_destination(destination_dir, relative.name)
+        os.replace(part, out_path)
+        try: sidecar_path(part).unlink()
+        except OSError: pass
+        return out_path
+
     def _handle_android_client(self, sock, addr):
-        current_name = None; received = 0; current_size = 0; started = time.monotonic()
+        tracked = sock
         try:
             sock.settimeout(120); tune_socket(sock)
             protocol = read_utf(sock)
             if protocol == PING_PROTOCOL:
-                write_utf(sock, pc_name())
-                write_int(sock, ANDROID_TCP_PORT)
-                self.bus.log.emit("تم الرد على فحص ظهور الحاسبة من الموبايل")
+                write_utf(sock, pc_name()); write_int(sock, ANDROID_TCP_PORT); return
+            if protocol in (SECURE_PROTOCOL, RANGE_PROTOCOL):
+                identity = tls_identity()  # raises if encryption is unavailable -> sender falls back
+                tls = identity["server"].wrap_socket(sock, server_side=True)
+                tracked = tls
+                with self.active_lock: self.active.add(tls)
+                if protocol == SECURE_PROTOCOL: self._handle_v6(tls, identity["der"])
+                else: self._handle_range(tls)
                 return
             if protocol not in (ANDROID_PROTOCOL, FOLDER_PROTOCOL, ACK_PROTOCOL): raise RuntimeError("بروتوكول غير معروف: " + protocol)
+            with self.active_lock: self.active.add(sock)
+            self._handle_legacy(sock, protocol)
+        except Exception as e:
+            with self.active_lock: cancelled = tracked in self.cancelled or sock in self.cancelled
+            if not cancelled and not self.stop_event.is_set(): self.bus.log.emit(f"فشل الاستلام: {e}")
+        finally:
+            with self.active_lock:
+                for s in (sock, tracked): self.active.discard(s); self.cancelled.discard(s)
+            for s in (tracked, sock):
+                try: s.close()
+                except Exception: pass
+
+    # ---------------------------------------------------------------- V3/V4/V5 (older apps)
+    def _handle_legacy(self, sock, protocol):
+        current = {"name": None, "done": 0, "size": 0, "started": time.monotonic()}
+        try:
             sender_name = read_utf(sock); count = read_int(sock); total_bytes = read_long(sock)
-            if not 0 <= count <= 10000 or total_bytes < 0:
-                raise ValueError("بيانات إرسال غير صالحة")
+            if not 0 <= count <= 10000 or total_bytes < 0: raise ValueError("بيانات إرسال غير صالحة")
             self.bus.log.emit(f"طلب استلام من {sender_name} | {count} ملف | {total_bytes/1024/1024:.2f} MB")
-            try:
-                save = downloads_received_dir()
+            try: save = downloads_received_dir()
             except OSError:
                 self.bus.log.emit("مكان الحفظ غير متوفر؛ وصل القرص أو اختر مكاناً آخر")
-                write_bool(sock, False)
-                return
+                write_bool(sock, False); return
+            decision = self._ask({"name": sender_name, "device_id": "", "count": count, "total": total_bytes,
+                                  "code": None, "legacy": True})
+            if decision == DECISION_REJECT: write_bool(sock, False); return
             write_bool(sock, True)
-            with self.active_lock: self.active_client = sock
             total_received_all = 0; start_all = time.time()
-            for index in range(count):
+            for _ in range(count):
                 raw_name = read_utf(sock)
                 relative = safe_relative_path(raw_name) if protocol in (FOLDER_PROTOCOL, ACK_PROTOCOL) else Path(safe_filename(raw_name))
                 filename = relative.as_posix(); size = read_long(sock)
-                current_name = filename; current_size = size
                 if size < 0: raise ValueError("حجم الملف غير صالح")
+                current.update(name=filename, size=size, done=0, started=time.monotonic())
                 part = partial_path(save, sender_name, filename, size)
                 recent_key = (sender_name, filename, size)
-                with self.recent_lock:
-                    now = time.monotonic()
-                    self.recent = {k: t for k, t in self.recent.items() if now - t < 900}
-                    already_saved = protocol == ACK_PROTOCOL and recent_key in self.recent and not part.exists()
-                if already_saved:
+                if protocol == ACK_PROTOCOL and not part.exists() and self._recent_saved(recent_key):
                     write_long(sock, size); write_long(sock, size)
                     transfer_update(self.bus, "استلام", filename, size, size, time.monotonic(), "مكتمل")
                     continue
                 resume_from = part.stat().st_size if part.exists() else 0
-                if resume_from > size:
-                    part.unlink(); resume_from = 0
+                if resume_from > size: part.unlink(); resume_from = 0
                 write_long(sock, resume_from)
-                self.bus.log.emit(f"استلام: {filename} ({size/1024/1024:.2f} MB)")
-                received = resume_from; total_received_all += resume_from
-                started = time.monotonic(); last_ui = 0
+                received = resume_from; total_received_all += resume_from; current["done"] = received
+                started = current["started"]; last_ui = 0
                 transfer_update(self.bus, "استلام", filename, received, size, started, "جاري", resume_from)
-                buffer = bytearray(IO_BUFFER); view = memoryview(buffer)
+                view = memoryview(bytearray(IO_BUFFER))
                 with open(part, "ab" if resume_from else "wb", buffering=IO_BUFFER) as f:
                     while received < size:
                         n = sock.recv_into(view, min(IO_BUFFER, size - received))
                         if not n: raise ConnectionError("انقطع الاتصال أثناء استلام الملف")
-                        f.write(view[:n]); received += n; total_received_all += n
+                        f.write(view[:n]); received += n; total_received_all += n; current["done"] = received
                         self.bus.progress.emit(max(0, min(100, int(total_received_all * 100 / max(1, total_bytes)))))
                         now = time.monotonic()
                         if now - last_ui >= 0.3:
                             transfer_update(self.bus, "استلام", filename, received, size, started, "جاري", resume_from); last_ui = now
-                destination_dir = save / relative.parent
-                destination_dir.mkdir(parents=True, exist_ok=True)
-                out_path = unique_destination(destination_dir, relative.name)
-                os.replace(part, out_path)
-                with self.recent_lock: self.recent[recent_key] = time.monotonic()
-                if protocol == ACK_PROTOCOL: write_long(sock, size)  # confirm: saved completely
+                out_path = self._finalize(save, relative, part, size)
+                self._remember_saved(recent_key)
+                if protocol == ACK_PROTOCOL: write_long(sock, size)
                 transfer_update(self.bus, "استلام", filename, size, size, started, "مكتمل")
                 self.bus.log.emit(f"تم حفظ الملف: {out_path.name}")
             speed = (total_received_all / 1024 / 1024) / max(time.time() - start_all, 0.01)
             self.bus.log.emit(f"اكتمل الاستلام | السرعة {speed:.2f} MB/s"); self.bus.progress.emit(100)
-        except Exception as e:
-            with self.active_lock: cancelled = self.cancelled_client is sock
-            if cancelled:
-                if current_name: transfer_update(self.bus, "استلام", current_name, received, current_size, started, "ملغي")
-            else: self.bus.log.emit(f"فشل الاستلام: {e}")
+        except Exception:
+            if current["name"]:
+                with self.active_lock: cancelled = sock in self.cancelled
+                transfer_update(self.bus, "استلام", current["name"], current["done"], current["size"], current["started"], "ملغي" if cancelled else "متوقف")
+            raise
+
+    # ---------------------------------------------------------------- V6 (encrypted, streamed)
+    def _handle_v6(self, s, cert_der):
+        sender_name = read_utf(s); sender_id = read_utf(s)[:64]; nonce = read_blob(s, 64); token = read_utf(s)
+        batch = read_utf(s)[:64]  # same for every retry of one send, so retries never duplicate files
+        count = read_int(s); total_bytes = read_long(s)
+        if not 0 <= count <= 100000 or total_bytes < 0: raise ValueError("بيانات إرسال غير صالحة")
+        manifest = []
+        for _ in range(count):
+            relative = safe_relative_path(read_utf(s)); size = read_long(s)
+            if size < 0: raise ValueError("حجم الملف غير صالح")
+            manifest.append((relative, size))
+        code = verify_code(cert_der, nonce)
+        with _trust_lock: trusted = load_trust()["trusted"].get(sender_id)
+        is_trusted = bool(trusted and token and hmac_equal(trusted.get("token", ""), token))
+        self.bus.log.emit(f"طلب استلام من {sender_name} | {count} ملف | {total_bytes/1024/1024:.2f} MB")
+        try: save = downloads_received_dir()
+        except OSError:
+            self.bus.log.emit("مكان الحفظ غير متوفر؛ وصل القرص أو اختر مكاناً آخر")
+            write_byte(s, DECISION_REJECT); write_blob(s, b""); return
+        decision = DECISION_ACCEPT if is_trusted else self._ask(
+            {"name": sender_name, "device_id": sender_id, "count": count, "total": total_bytes, "code": code,
+             "legacy": False, "files": [r.as_posix() for r, _ in manifest[:5]]})
+        write_byte(s, decision)
+        if decision == DECISION_REJECT: write_blob(s, b""); return
+        if decision == DECISION_TRUST:
+            new_token = os.urandom(32).hex()
+            with _trust_lock:
+                data = load_trust(); data["trusted"][sender_id] = {"name": sender_name, "token": new_token}; save_trust(data)
+            write_utf(s, new_token)
+        key = os.urandom(16); write_blob(s, key)
+        # Resume offsets for all files at once, so the sender streams without waiting between files.
+        offsets = []
+        for relative, size in manifest:
+            filename = relative.as_posix(); part = partial_path(save, sender_name, filename, size)
+            if not part.exists() and self._recent_saved((sender_id, batch, filename, size)): offsets.append(size); continue
+            safe = read_safe_offset(part)
+            offset = safe if safe is not None else (part.stat().st_size if part.exists() else 0)
+            if offset > size: offset = 0
+            offsets.append(offset)
+        for offset in offsets: write_long(s, offset)
+        session = {"files": {}, "cond": threading.Condition()}
+        with self.sessions_lock: self.sessions[key] = session
+        start_all = time.time(); received_all = sum(offsets)
+        try:
+            while True:
+                index = read_int(s)
+                if index == -1: break
+                if not 0 <= index < count: raise ValueError("bad index")
+                mode = read_byte(s)
+                relative, size = manifest[index]; filename = relative.as_posix()
+                part = partial_path(save, sender_name, filename, size); offset = offsets[index]
+                recent_key = (sender_id, batch, filename, size)
+                started = time.monotonic()
+                if offset >= size and not part.exists() and self._recent_saved(recent_key):
+                    write_int(s, index); write_long(s, size)
+                    transfer_update(self.bus, "استلام", filename, size, size, started, "مكتمل"); continue
+                transfer_update(self.bus, "استلام", filename, offset, size, started, "جاري", offset)
+                if mode == 0:
+                    received = offset; last_ui = 0; view = memoryview(bytearray(IO_BUFFER))
+                    with open(part, "r+b" if part.exists() else "wb", buffering=IO_BUFFER) as f:
+                        f.seek(offset)
+                        while received < size:
+                            n = s.recv_into(view, min(IO_BUFFER, size - received))
+                            if not n: raise ConnectionError("انقطع الاتصال أثناء استلام الملف")
+                            f.write(view[:n]); received += n; received_all += n
+                            now = time.monotonic()
+                            if now - last_ui >= 0.3:
+                                transfer_update(self.bus, "استلام", filename, received, size, started, "جاري", offset); last_ui = now
+                                self.bus.progress.emit(max(0, min(100, int(received_all * 100 / max(1, total_bytes)))))
+                    if read_safe_offset(part) is not None:
+                        try: sidecar_path(part).unlink()
+                        except OSError: pass
+                else:
+                    streams = read_int(s)
+                    if not 1 <= streams <= 8: raise ValueError("bad streams")
+                    if not part.exists(): part.touch()
+                    pf = _ParallelFile(part, size, offset, streams)
+                    with session["cond"]: session["files"][index] = pf; session["cond"].notify_all()
+                    last_ui = 0
+                    while not pf.done.wait(0.3):
+                        if pf.failed: break
+                        transfer_update(self.bus, "استلام", filename, pf.received(), size, started, "جاري", offset)
+                    if pf.failed or pf.finished < streams: raise ConnectionError(pf.failed or "انقطع أحد مسارات النقل")
+                    received_all += size - offset
+                out_path = self._finalize(save, relative, part, size)
+                self._remember_saved(recent_key)
+                write_int(s, index); write_long(s, size)
+                transfer_update(self.bus, "استلام", filename, size, size, started, "مكتمل")
+                self.bus.log.emit(f"تم حفظ الملف: {out_path.name}")
+            write_int(s, -1)
+            speed = ((received_all) / 1024 / 1024) / max(time.time() - start_all, 0.01)
+            self.bus.log.emit(f"اكتمل الاستلام | السرعة {speed:.2f} MB/s"); self.bus.progress.emit(100)
+        except Exception:
+            with session["cond"]:
+                for pf in session["files"].values():
+                    pf.failed = pf.failed or "session closed"; pf.done.set()
+            raise
         finally:
-            with self.active_lock:
-                if self.active_client is sock: self.active_client = None
-                if self.cancelled_client is sock: self.cancelled_client = None
-            try: sock.close()
-            except Exception: pass
+            with self.sessions_lock: self.sessions.pop(key, None)
+
+    def _handle_range(self, s):
+        key = read_blob(s, 64); index = read_int(s); start = read_long(s); length = read_long(s)
+        with self.sessions_lock: session = self.sessions.get(key)
+        if session is None: raise ValueError("جلسة غير معروفة")
+        deadline = time.monotonic() + 60
+        with session["cond"]:
+            while index not in session["files"]:
+                left = deadline - time.monotonic()
+                if left <= 0: raise TimeoutError("range setup")
+                session["cond"].wait(left)
+            pf = session["files"][index]
+        if start < 0 or length < 0 or start + length > pf.size: raise ValueError("bad range")
+        with pf.lock: pf.ranges[start] = (start + length, 0)
+        written = 0; view = memoryview(bytearray(IO_BUFFER))
+        try:
+            with open(pf.part, "r+b", buffering=0) as f:
+                f.seek(start)
+                while written < length:
+                    n = s.recv_into(view, min(IO_BUFFER, length - written))
+                    if not n: raise ConnectionError("range closed")
+                    f.write(view[:n]); written += n
+                    pf.progress(start, written)
+            pf.progress(start, written, final=True)
+            write_long(s, written)
+            with pf.lock:
+                pf.finished += 1
+                if pf.finished >= pf.expected: pf.done.set()
+        except Exception as e:
+            pf.progress(start, written, final=True)
+            pf.failed = str(e) or "range failed"; pf.done.set()
+            raise
+
+def hmac_equal(a: str, b: str) -> bool:
+    import hmac
+    return hmac.compare_digest(a.encode(), b.encode())
 
 
 class Discovery:
@@ -557,38 +841,61 @@ class Discovery:
         deadline = time.time() + 12
         for t in threads: t.join(max(0.05, deadline - time.time()))
 
+class _LegacyReceiver(Exception): pass
+class _Rejected(Exception): pass
+
 class Sender:
-    def __init__(self, bus): self.bus = bus; self.current_socket = None; self.cancelled = threading.Event()
+    """Sends a batch. Tries the encrypted V6 protocol first and falls back to V5 / V3 for
+    older receivers. A file counts as done only after the receiver confirms it was saved;
+    if the connection drops it reconnects and resumes from the last byte."""
+    def __init__(self, bus):
+        self.bus = bus; self.current_socket = None; self.sockets = set(); self.sockets_lock = threading.Lock()
+        self.cancelled = threading.Event(); self.parallel = True
     def cancel_current(self):
         self.cancelled.set()
-        if self.current_socket:
-            try: self.current_socket.shutdown(socket.SHUT_RDWR)
+        with self.sockets_lock: sockets = list(self.sockets)
+        for s in sockets:
+            try: s.shutdown(socket.SHUT_RDWR)
             except OSError: pass
         self.bus.log.emit("تم إلغاء الإرسال الحالي")
-    def is_busy(self): return self.current_socket is not None
+    def is_busy(self):
+        with self.sockets_lock: return bool(self.sockets)
     def send_files(self, host, port, file_paths): threading.Thread(target=self._send_android_protocol, args=(host, int(port), file_paths), daemon=True).start()
+
+    def _track(self, s):
+        with self.sockets_lock: self.sockets.add(s)
+        self.current_socket = s
+    def _untrack(self, s):
+        with self.sockets_lock: self.sockets.discard(s)
+        if self.current_socket is s: self.current_socket = None
+        try: s.close()
+        except OSError: pass
+
     def _send_android_protocol(self, host, port, file_paths):
-        """Send a batch. Each file counts as done only after the receiver confirms it was
-        saved; on a dropped connection it reconnects and resumes from the last byte."""
         self.cancelled.clear()
         self._current = {"name": None, "done": 0, "size": 0, "started": 0}
         try:
             files = selected_entries(file_paths)
             if not files: self.bus.log.emit("لم يتم اختيار ملفات صالحة."); return
-            finished = set(); legacy = False; attempt = 0; start = time.time()
+            finished = set(); attempt = 0; start = time.time(); batch = os.urandom(8).hex()
+            level = 0 if encryption_available() else 1   # 0 = V6 encrypted, 1 = V5, 2 = V3/V4
             total_size = sum(size for _, _, size in files)
             while not self.cancelled.is_set():
                 remaining = [f for f in files if f[1] not in finished]
                 if not remaining: break
                 attempt += 1
                 try:
-                    self._send_once(host, port, remaining, finished, not legacy)
+                    if level == 0: self._send_v6(host, port, remaining, finished, batch)
+                    else: self._send_once(host, port, remaining, finished, level == 1)
                     break
                 except _LegacyReceiver:
-                    legacy = True; attempt -= 1
-                    self.bus.log.emit("الجهاز المستلم بنسخة قديمة؛ يُفضّل تحديثه")
+                    if level >= 2: raise ConnectionError("الجهاز المستلم لا يستجيب")
+                    level += 1; attempt -= 1
+                    if level == 1: self.bus.log.emit("الجهاز المستلم بنسخة قديمة؛ النقل بدون تشفير. يُفضّل تحديثه")
                 except _Rejected:
-                    self.bus.log.emit("تم رفض الاستلام من الجهاز الآخر"); return
+                    self.bus.log.emit("تم رفض الاستلام من الجهاز الآخر")
+                    for _, name, size in remaining: transfer_update(self.bus, "إرسال", name, 0, size, time.monotonic(), "مرفوض")
+                    return
                 except (OSError, ConnectionError, EOFError, struct.error) as e:
                     if self.cancelled.is_set(): raise
                     if attempt >= MAX_SEND_ATTEMPTS: raise
@@ -606,14 +913,138 @@ class Sender:
                 if c["name"]: transfer_update(self.bus, "إرسال", c["name"], c["done"], c["size"], c["started"], "فشل")
                 self.bus.log.emit(f"فشل الإرسال إلى الجهاز: {e}")
 
+    # ---------------------------------------------------------------- V6
+    def _open_tls(self, host, port, header):
+        raw = socket.create_connection((host, port), timeout=15); tune_socket(raw); raw.settimeout(150)
+        self._track(raw)
+        try:
+            write_utf(raw, header)
+            tls = client_tls_context().wrap_socket(raw)
+        except socket.timeout:
+            self._untrack(raw); raise
+        except (OSError, ConnectionError) as e:
+            self._untrack(raw)
+            import ssl as _ssl
+            if header == SECURE_PROTOCOL and not isinstance(e, _ssl.SSLCertVerificationError): raise _LegacyReceiver()
+            raise
+        with self.sockets_lock: self.sockets.discard(raw); self.sockets.add(tls)
+        self.current_socket = tls
+        return tls
+
+    def _send_v6(self, host, port, files, finished, batch=""):
+        s = self._open_tls(host, port, SECURE_PROTOCOL)
+        ack_thread = None
+        try:
+            der = s.getpeercert(True); fingerprint = hashlib.sha256(der).hexdigest()
+            nonce = os.urandom(16); code = verify_code(der, nonce)
+            with _trust_lock: known = load_trust()["known"].get(fingerprint, {})
+            verify = getattr(self.bus, "verify", None)
+            if verify is not None and not known.get("token"): verify.emit(host, code)
+            if not known.get("token"): self.bus.log.emit(f"رمز التحقق {code} · تأكد أنه نفس الرمز على الجهاز الثاني")
+            write_utf(s, pc_name()); write_utf(s, device_id()); write_blob(s, nonce); write_utf(s, known.get("token", "")); write_utf(s, batch)
+            write_int(s, len(files)); write_long(s, sum(size for _, _, size in files))
+            for _, name, size in files: write_utf(s, name); write_long(s, size)
+            decision = read_byte(s)
+            if decision == DECISION_TRUST:
+                token = read_utf(s)
+                with _trust_lock:
+                    data = load_trust(); data["known"][fingerprint] = {"name": host, "token": token}; save_trust(data)
+            key = read_blob(s, 64)
+            if decision == DECISION_REJECT: raise _Rejected()
+            offsets = [read_long(s) for _ in files]
+            acked = {}; ack_error = []
+            def read_acks():
+                try:
+                    while True:
+                        index = read_int(s)
+                        if index == -1: acked[-1] = True; return
+                        size = read_long(s); acked[index] = size
+                        _, name, expected = files[index]
+                        if size == expected:
+                            finished.add(name)
+                            transfer_update(self.bus, "إرسال", name, size, size, time.monotonic(), "مكتمل")
+                except Exception as e:
+                    ack_error.append(e)
+            ack_thread = threading.Thread(target=read_acks, daemon=True); ack_thread.start()
+            total = sum(size for _, _, size in files); sent_all = sum(offsets)
+            for index, (path, name, size) in enumerate(files):
+                if self.cancelled.is_set(): return
+                if ack_error: raise ConnectionError(str(ack_error[0]))
+                offset = min(offsets[index], size); started = time.monotonic()
+                self._current = {"name": name, "done": offset, "size": size, "started": started}
+                remaining = size - offset
+                if self.parallel and remaining >= PARALLEL_MIN:
+                    streams = PARALLEL_STREAMS
+                    write_int(s, index); write_byte(s, 1); write_int(s, streams)
+                    chunk = -(-remaining // streams); ranges = []
+                    for i in range(streams):
+                        a = offset + i * chunk; b = min(size, a + chunk)
+                        if b > a: ranges.append((a, b - a))
+                    if len(ranges) != streams:  # tiny tail: tell receiver the real count
+                        raise ValueError("range split")
+                    progress = {"sent": 0}; plock = threading.Lock(); errors = []
+                    def push(a, length):
+                        r = None
+                        try:
+                            r = self._open_tls(host, port, RANGE_PROTOCOL)
+                            if hashlib.sha256(r.getpeercert(True)).hexdigest() != fingerprint: raise ConnectionError("شهادة مختلفة")
+                            write_blob(r, key); write_int(r, index); write_long(r, a); write_long(r, length)
+                            with open(path, "rb", buffering=0) as f:
+                                f.seek(a); left = length
+                                while left and not self.cancelled.is_set():
+                                    chunk_data = f.read(min(IO_BUFFER, left))
+                                    if not chunk_data: raise ValueError("الملف أقصر من حجمه المعلن")
+                                    r.sendall(chunk_data); left -= len(chunk_data)
+                                    with plock: progress["sent"] += len(chunk_data)
+                            if self.cancelled.is_set(): return
+                            if read_long(r) != length: raise ConnectionError("range not confirmed")
+                        except Exception as e:
+                            errors.append(e)
+                        finally:
+                            if r is not None: self._untrack(r)
+                    threads = [threading.Thread(target=push, args=rg, daemon=True) for rg in ranges]
+                    for t in threads: t.start()
+                    while any(t.is_alive() for t in threads):
+                        for t in threads: t.join(0.3)
+                        with plock: done = offset + progress["sent"]
+                        self._current["done"] = done
+                        transfer_update(self.bus, "إرسال", name, min(done, size - 1), size, started, "جاري", offset)
+                        self.bus.progress.emit(max(0, min(100, int((sent_all + done - offset) * 100 / max(1, total)))))
+                    if errors: raise errors[0] if isinstance(errors[0], (OSError, ConnectionError)) else ConnectionError(str(errors[0]))
+                    sent_all += remaining
+                else:
+                    write_int(s, index); write_byte(s, 0)
+                    last_ui = 0
+                    with open(path, "rb", buffering=IO_BUFFER) as f:
+                        f.seek(offset); left = remaining
+                        transfer_update(self.bus, "إرسال", name, offset, size, started, "جاري", offset)
+                        while left and not self.cancelled.is_set():
+                            chunk_data = f.read(min(IO_BUFFER, left))
+                            if not chunk_data: raise ValueError(f"الملف أقصر من حجمه المعلن: {name}")
+                            s.sendall(chunk_data); left -= len(chunk_data); sent_all += len(chunk_data)
+                            self._current["done"] += len(chunk_data)
+                            now = time.monotonic()
+                            if now - last_ui >= 0.3:
+                                transfer_update(self.bus, "إرسال", name, min(size - left, size - 1), size, started, "جاري", offset); last_ui = now
+                                self.bus.progress.emit(max(0, min(100, int(sent_all * 100 / max(1, total)))))
+                    if self.cancelled.is_set(): return
+            write_int(s, -1)
+            ack_thread.join(300)
+            if ack_error and -1 not in acked: raise ConnectionError(str(ack_error[0]))
+            missing = [name for i, (_, name, size) in enumerate(files) if acked.get(i) != size]
+            if missing: raise ConnectionError("لم يؤكد المستلم: " + ", ".join(missing[:3]))
+        finally:
+            self._untrack(s)
+
+    # ---------------------------------------------------------------- V3/V4/V5
     def _send_once(self, host, port, files, finished, ack):
         total_size = sum(size for _, _, size in files)
         if ack: protocol = ACK_PROTOCOL
         else: protocol = FOLDER_PROTOCOL if any("/" in name for _, name, _ in files) else ANDROID_PROTOCOL
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); self.current_socket = s
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); self._track(s)
         try:
             s.settimeout(120); tune_socket(s)
-            self.bus.log.emit(f"الاتصال بالجهاز {host}:{port} ..."); s.connect((host, port))
+            s.connect((host, port))
             try:
                 write_utf(s, protocol); write_utf(s, pc_name()); write_int(s, len(files)); write_long(s, total_size)
                 accepted = read_bool(s)
@@ -624,7 +1055,6 @@ class Sender:
                 if ack: raise _LegacyReceiver()
                 raise
             if not accepted: raise _Rejected()
-            self.bus.log.emit("تم قبول الطلب، بدأ الإرسال")
             sent_all = 0
             for p, relative_name, size in files:
                 if self.cancelled.is_set(): return
@@ -632,11 +1062,9 @@ class Sender:
                 if resume_from < 0 or resume_from > size: resume_from = 0
                 started = time.monotonic()
                 self._current = {"name": relative_name, "done": resume_from, "size": size, "started": started}
-                if resume_from: self.bus.log.emit(f"استئناف {relative_name} من {resume_from/1024/1024:.2f} MB")
                 sent_all += resume_from
                 with open(p, "rb", buffering=IO_BUFFER) as f:
                     if resume_from: f.seek(resume_from)
-                    self.bus.log.emit(f"إرسال: {relative_name} ({size/1024/1024:.2f} MB)")
                     remaining = size - resume_from; last_ui = 0
                     transfer_update(self.bus, "إرسال", relative_name, resume_from, size, started, "جاري", resume_from)
                     while remaining and not self.cancelled.is_set():
@@ -644,25 +1072,18 @@ class Sender:
                         if not chunk: raise ValueError(f"الملف أقصر من حجمه المعلن: {relative_name}")
                         s.sendall(chunk); sent_all += len(chunk); self._current["done"] += len(chunk)
                         remaining -= len(chunk)
-                        self.bus.progress.emit(max(0, min(100, int(sent_all * 100 / max(1, total_size)))))
                         now = time.monotonic()
                         if now - last_ui >= 0.3:
-                            # Keep 99% until the receiver confirms the file was saved.
                             shown = min(size - remaining, max(0, size - 1)) if ack else size - remaining
                             transfer_update(self.bus, "إرسال", relative_name, shown, size, started, "جاري", resume_from); last_ui = now
+                            self.bus.progress.emit(max(0, min(100, int(sent_all * 100 / max(1, total_size)))))
                     if self.cancelled.is_set(): return
                 if ack:
-                    transfer_update(self.bus, "إرسال", relative_name, max(0, size - 1), size, started, "جاري", resume_from)
                     if read_long(s) != size: raise ConnectionError(f"المستلم لم يحفظ الملف كاملاً: {relative_name}")
                 finished.add(relative_name)
                 transfer_update(self.bus, "إرسال", relative_name, size, size, started, "مكتمل")
         finally:
-            try: s.close()
-            except OSError: pass
-            if self.current_socket is s: self.current_socket = None
-
-class _LegacyReceiver(Exception): pass
-class _Rejected(Exception): pass
+            self._untrack(s)
 
 def asset_path(name) -> Path:
     return Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "assets" / name
@@ -684,7 +1105,7 @@ def save_history(entries):
     except OSError:
         pass
 
-FINAL_STATES = ("مكتمل", "ملغي", "فشل")
+FINAL_STATES = ("مكتمل", "ملغي", "فشل", "مرفوض", "متوقف")
 
 class TransferTable(QTableWidget):
     """قائمة الملفات المرسلة أو المستلمة: الأحدث بالأعلى مع شريط تقدم لكل ملف."""
