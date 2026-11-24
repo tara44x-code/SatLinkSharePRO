@@ -14,7 +14,7 @@ except ImportError:
     QT_BINDING = "PyQt5"
 
 APP_NAME = "SatLink Share PRO"
-APP_VERSION = "5.0"
+APP_VERSION = "5.1"
 DEVELOPER = "مهند سات لنك"
 ANDROID_TCP_PORT = 8988
 ANDROID_UDP_PORT = 8989
@@ -275,11 +275,13 @@ def transfer_eta(remaining, speed):
     if seconds >= 3600: return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
     return f"{seconds // 60}m {seconds % 60}s"
 
-def transfer_update(bus, direction, filename, done, size, started, state, origin=0):
+def transfer_update(bus, direction, filename, done, size, started, state, origin=0, parts=0):
     speed = max(0, done - origin) / max(time.monotonic() - started, 0.01) if state == "جاري" else 0
     percent = 100 if size == 0 and state == "مكتمل" else int(done * 100 / max(size, 1))
+    speed_text = f"{speed / 1048576:.1f} MB/s" if speed else "—"
+    if parts > 1 and state == "جاري": speed_text += f" ⚡{parts}"
     bus.transfer.emit(direction, filename, min(100, max(0, percent)),
-                      f"{speed / 1048576:.1f} MB/s" if speed else "—",
+                      speed_text,
                       transfer_eta(max(0, size - done), speed), state)
 
 # --------------------------------------------------------------------------- V6: encryption & trust
@@ -363,6 +365,9 @@ SECURE_PROTOCOL = "SATLINK_SHARE_PRO_V6_SECURE"
 RANGE_PROTOCOL = "SATLINK_SHARE_PRO_V6_RANGE"
 PARALLEL_MIN = 32 * 1024 * 1024   # files bigger than this go over several connections
 PARALLEL_STREAMS = 3
+BIG_FILE = 1024 * 1024 * 1024   # files bigger than 1 GB go over 6 connections
+BIG_FILE_STREAMS = 6
+def streams_for(remaining): return BIG_FILE_STREAMS if remaining >= BIG_FILE else PARALLEL_STREAMS
 DECISION_REJECT, DECISION_ACCEPT, DECISION_TRUST = 0, 1, 2
 
 def sidecar_path(part: Path) -> Path: return part.with_suffix(".json")
@@ -687,7 +692,7 @@ class ReceiverServer:
                     last_ui = 0
                     while not pf.done.wait(0.3):
                         if pf.failed: break
-                        transfer_update(self.bus, "استلام", filename, pf.received(), size, started, "جاري", offset)
+                        transfer_update(self.bus, "استلام", filename, pf.received(), size, started, "جاري", offset, streams)
                     if pf.failed or pf.finished < streams: raise ConnectionError(pf.failed or "انقطع أحد مسارات النقل")
                     received_all += size - offset
                 out_path = self._finalize(save, relative, part, size)
@@ -1001,7 +1006,7 @@ class Sender:
                 self._current = {"name": name, "done": offset, "size": size, "started": started}
                 remaining = size - offset
                 if self.parallel and remaining >= PARALLEL_MIN:
-                    streams = PARALLEL_STREAMS
+                    streams = streams_for(remaining)
                     write_int(s, index); write_byte(s, 1); write_int(s, streams)
                     chunk = -(-remaining // streams); ranges = []
                     for i in range(streams):
@@ -1035,7 +1040,7 @@ class Sender:
                         for t in threads: t.join(0.3)
                         with plock: done = offset + progress["sent"]
                         self._current["done"] = done
-                        transfer_update(self.bus, "إرسال", name, min(done, size - 1), size, started, "جاري", offset)
+                        transfer_update(self.bus, "إرسال", name, min(done, size - 1), size, started, "جاري", offset, streams)
                         self.bus.progress.emit(max(0, min(100, int((sent_all + done - offset) * 100 / max(1, total)))))
                     if errors: raise errors[0] if isinstance(errors[0], (OSError, ConnectionError)) else ConnectionError(str(errors[0]))
                     sent_all += remaining

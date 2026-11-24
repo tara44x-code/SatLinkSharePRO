@@ -107,7 +107,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
     private final HashMap<String, RowViews> rows = new HashMap<>();
 
     private static final class RowViews {
-        TextView title, sub, meta, action; ProgressBar bar;
+        TextView title, sub, meta, action; PartsBar bar;
     }
 
     @Override
@@ -1106,10 +1106,8 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         box.addView(r.sub, lp(-1, -2));
         r.meta = text("", 11, MUTED, false);
         box.addView(r.meta, lp(-1, -2));
-        r.bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        r.bar.setMax(100);
-        r.bar.setProgressDrawable(progressDrawable());
-        LinearLayout.LayoutParams bp = lp(-1, dp(6));
+        r.bar = new PartsBar(this, L.light());
+        LinearLayout.LayoutParams bp = lp(-1, dp(7));
         bp.topMargin = dp(8);
         box.addView(r.bar, bp);
         rows.put(e.id, r);
@@ -1134,6 +1132,8 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         StringBuilder sub = new StringBuilder();
         if (e.peer != null && !e.peer.isEmpty())
             sub.append(TransferLog.SEND.equals(e.direction) ? L.t("إلى ", "to ") : L.t("من ", "from ")).append(e.peer).append(" · ");
+        if (e.isActive() && e.parts != null && e.parts.length > 1)
+            sub.append("⚡ ").append(e.parts.length).append(L.t(" أجزاء · ", " parts · "));
         if (e.isActive()) {
             sub.append(e.percent()).append("% · ").append(NetworkUtils.formatBytes(e.done)).append(" / ").append(NetworkUtils.formatBytes(e.size));
             if (e.speed > 0) {
@@ -1153,7 +1153,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
             meta += " · " + L.t("المدة ", "took ") + eta(Math.max(1, ms / 1000)) + " · " + L.t("السرعة ", "avg ") + NetworkUtils.formatSpeed(e.size * 1000 / Math.max(1, ms));
         }
         r.meta.setText(meta);
-        r.bar.setProgress(e.percent());
+        r.bar.set(e.percent(), e.isActive() ? e.parts : null);
         r.action.setVisibility(resumable(e) ? View.VISIBLE : View.GONE);
     }
 

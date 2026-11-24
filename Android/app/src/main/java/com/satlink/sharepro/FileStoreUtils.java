@@ -92,6 +92,36 @@ public class FileStoreUtils {
                 (slash < 0 ? "" : relativeName.substring(0, slash + 1));
     }
 
+    /**
+     * يفتح الملف من موضع معيّن بقفزة مباشرة (بدون قراءة ما قبله). مهم للأجزاء المتوازية:
+     * القراءة من البداية حتى منتصف ملف 4 GB كانت تشغل الذاكرة وتبطّئ باقي الأجزاء.
+     */
+    public static InputStream openInputAt(Context context, Uri uri, long offset) throws IOException {
+        try {
+            final ParcelFileDescriptor pfd = context.getContentResolver().openFileDescriptor(uri, "r");
+            if (pfd != null) {
+                final FileInputStream in = new FileInputStream(pfd.getFileDescriptor());
+                try {
+                    in.getChannel().position(offset);
+                    return new java.io.FilterInputStream(in) {
+                        @Override public void close() throws IOException { try { super.close(); } finally { pfd.close(); } }
+                    };
+                } catch (IOException e) { in.close(); pfd.close(); }
+            }
+        } catch (Exception ignored) {}
+        InputStream in = openInput(context, uri);
+        long skipped = 0;
+        while (skipped < offset) {
+            long n = in.skip(offset - skipped);
+            if (n <= 0) {
+                if (in.read() == -1) { in.close(); throw new IOException("تعذر الوصول لموضع الجزء"); }
+                n = 1;
+            }
+            skipped += n;
+        }
+        return in;
+    }
+
     public static InputStream openInput(Context context, Uri uri) throws IOException {
         InputStream inputStream = context.getContentResolver().openInputStream(uri);
         if (inputStream == null) throw new IOException("تعذر فتح الملف");

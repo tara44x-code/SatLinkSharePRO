@@ -47,6 +47,8 @@ public final class TransferLog {
         public long endTime;
         /** للإرسال: رابط الملف الأصلي وعنوان الجهاز، حتى يمكن الإكمال بضغطة. */
         public String source;
+        /** تقدم كل جزء عند تقسيم الملف (null إذا ما انقسم). */
+        public volatile int[] parts;
         public String targetIp;
         public int targetPort;
 
@@ -157,6 +159,13 @@ public final class TransferLog {
     }
 
     public static synchronized Entry get(String id) { return entries.get(id); }
+
+    public static synchronized void parts(Context context, String direction, String session, String name, int[] percents) {
+        Entry e = entries.get(direction + "|" + session + "|" + name);
+        if (e == null) return;
+        e.parts = percents;
+        notify(e, false);
+    }
 
     public static synchronized void remove(Context context, String id) {
         entries.remove(id);

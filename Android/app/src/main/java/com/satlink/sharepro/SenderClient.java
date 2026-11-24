@@ -37,6 +37,11 @@ public class SenderClient {
     public static final String RANGE_PROTOCOL = "SATLINK_SHARE_PRO_V6_RANGE";
     static final long PARALLEL_MIN = 32L * 1024 * 1024;
     static final int PARALLEL_STREAMS = 3;
+    static final long BIG_FILE = Long.getLong("satlink.bigfile", 1024L * 1024 * 1024);
+    static final int BIG_FILE_STREAMS = 6;
+
+    /** عدد الأجزاء: 6 للملفات فوق 1 GB، و3 للأصغر. */
+    static int streamsFor(long remaining) { return remaining >= BIG_FILE ? BIG_FILE_STREAMS : PARALLEL_STREAMS; }
     private static final int BUFFER = 512 * 1024;
     private static final int MAX_ATTEMPTS = 10;
 
@@ -48,6 +53,8 @@ public class SenderClient {
         void onFileStarted(String batch, String name, long size, long resumeFrom);
         void onProgress(String batch, String name, long done, long size, long speed);
         void onFileFinished(String batch, String name);
+        /** تقدم كل جزء (0..100) للملف المقسّم. */
+        default void onParts(String batch, String name, int[] percents) {}
         void onBatchEnded(String batch, boolean completed, boolean cancelled, String error);
     }
 
@@ -238,8 +245,9 @@ public class SenderClient {
                 listener.onFileStarted(batch, item.name, size, offset);
                 long remaining = size - offset;
                 if (parallel && remaining >= PARALLEL_MIN) {
-                    out.writeInt(index); out.writeByte(1); out.writeInt(PARALLEL_STREAMS); out.flush();
-                    sendParallel(batch, device, fingerprint, key, index, item, offset);
+                    int streams = streamsFor(remaining);
+                    out.writeInt(index); out.writeByte(1); out.writeInt(streams); out.flush();
+                    sendParallel(batch, device, fingerprint, key, index, item, offset, streams);
                 } else {
                     out.writeInt(index); out.writeByte(0);
                     streamFile(batch, item, offset, out, buffer);
@@ -266,9 +274,8 @@ public class SenderClient {
     private void streamFile(String batch, FileItem item, long offset, DataOutputStream out, byte[] buffer) throws IOException {
         long size = item.size, sent = offset, lastBytes = offset, lastTick = System.currentTimeMillis();
         if (sent >= size) return;
-        try (InputStream raw = FileStoreUtils.openInput(context, item.uri);
+        try (InputStream raw = FileStoreUtils.openInputAt(context, item.uri, offset);
              BufferedInputStream fileIn = new BufferedInputStream(raw, BUFFER)) {
-            skipFully(fileIn, offset);
             int read;
             while (!cancelled.get() && sent < size &&
                     (read = fileIn.read(buffer, 0, (int) Math.min(buffer.length, size - sent))) != -1) {
@@ -287,15 +294,19 @@ public class SenderClient {
         if (sent != size) throw new IOException("الملف تغيّر أثناء الإرسال: " + item.name);
     }
 
-    private void sendParallel(String batch, DeviceInfo device, String fingerprint, byte[] key, int index, FileItem item, long offset) throws IOException {
+    private void sendParallel(String batch, DeviceInfo device, String fingerprint, byte[] key, int index, FileItem item, long offset, int streams) throws IOException {
         long remaining = item.size - offset;
-        long chunk = (remaining + PARALLEL_STREAMS - 1) / PARALLEL_STREAMS;
+        long chunk = (remaining + streams - 1) / streams;
         final AtomicLong progress = new AtomicLong();
+        final long[] partDone = new long[streams];
+        final long[] partLen = new long[streams];
         final IOException[] error = new IOException[1];
         List<Thread> threads = new ArrayList<>();
-        for (int i = 0; i < PARALLEL_STREAMS; i++) {
+        for (int i = 0; i < streams; i++) {
+            final int part = i;
             final long start = offset + i * chunk;
             final long length = Math.min(item.size, start + chunk) - start;
+            partLen[i] = length;
             Thread t = new Thread(() -> {
                 SSLSocket r = null;
                 try {
@@ -309,15 +320,15 @@ public class SenderClient {
                     out.writeInt(index); out.writeLong(start); out.writeLong(length);
                     byte[] buffer = new byte[BUFFER];
                     long left = length;
-                    try (InputStream raw = FileStoreUtils.openInput(context, item.uri);
+                    try (InputStream raw = FileStoreUtils.openInputAt(context, item.uri, start);
                          BufferedInputStream fileIn = new BufferedInputStream(raw, BUFFER)) {
-                        skipFully(fileIn, start);
                         while (left > 0 && !cancelled.get()) {
                             int n = fileIn.read(buffer, 0, (int) Math.min(buffer.length, left));
                             if (n == -1) throw new IOException("الملف أقصر من حجمه");
                             out.write(buffer, 0, n);
                             left -= n;
                             progress.addAndGet(n);
+                            synchronized (partDone) { partDone[part] += n; }
                         }
                     }
                     out.flush();
@@ -339,6 +350,9 @@ public class SenderClient {
                 long now = System.currentTimeMillis(), got = progress.get();
                 if (now - lastTick >= 300) {
                     listener.onProgress(batch, item.name, Math.min(offset + got, item.size - 1), item.size, (got - lastBytes) * 1000 / Math.max(1, now - lastTick));
+                    int[] pct = new int[streams];
+                    synchronized (partDone) { for (int p = 0; p < streams; p++) pct[p] = (int) (partLen[p] == 0 ? 100 : partDone[p] * 100 / partLen[p]); }
+                    listener.onParts(batch, item.name, pct);
                     lastBytes = got; lastTick = now;
                 }
             }

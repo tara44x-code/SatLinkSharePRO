@@ -296,6 +296,10 @@ public class ReceiveService extends Service implements ReceiverServer.Listener {
         update(L.t("استلام: ", "Receiving: ") + name + " · " + p + "% · " + NetworkUtils.formatSpeed(speed), p);
     }
 
+    @Override public void onParts(String session, String name, int[] percents) {
+        TransferLog.parts(this, TransferLog.RECEIVE, key(session), name, percents);
+    }
+
     @Override public void onFileSaved(String session, String name, long size, Uri uri) {
         TransferLog.finish(this, TransferLog.RECEIVE, key(session), name, TransferLog.STATE_DONE, uri == null ? null : uri.toString());
     }

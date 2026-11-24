@@ -53,6 +53,8 @@ public class ReceiverServer {
         void onFileStarted(String session, String sender, String name, long size, long resumeFrom);
         void onProgress(String session, String name, long done, long size, long speed);
         void onFileSaved(String session, String name, long size, Uri uri);
+        /** تقدم كل جزء (0..100) للملف المقسّم، مرتبة حسب موضعها بالملف. */
+        default void onParts(String session, String name, int[] percents) {}
         void onSessionEnded(String session, boolean completed, boolean cancelled);
         void onServerFailed(String message, Exception e);
     }
@@ -257,6 +259,17 @@ public class ReceiverServer {
             }
             return safe;
         }
+        synchronized int[] percents() {
+            int[] out = new int[expected];
+            int i = 0;
+            for (Map.Entry<Long, long[]> e : ranges.entrySet()) {
+                if (i >= expected) break;
+                long len = e.getValue()[0] - e.getKey();
+                out[i++] = (int) (len <= 0 ? 100 : Math.min(100, e.getValue()[1] * 100 / len));
+            }
+            return out;
+        }
+
         synchronized long received() {
             long sum = origin;
             for (long[] r : ranges.values()) sum += r[1];
@@ -368,6 +381,7 @@ public class ReceiverServer {
                                 long got = pf.received();
                                 if (now - lastTick >= 300) {
                                     listener.onProgress(session, name, got, size, (got - lastBytes) * 1000 / Math.max(1, now - lastTick));
+                                    listener.onParts(session, name, pf.percents());
                                     lastTick = now; lastBytes = got;
                                 }
                             }

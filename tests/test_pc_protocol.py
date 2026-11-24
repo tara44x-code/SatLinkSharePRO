@@ -449,7 +449,7 @@ class ProtocolTests(unittest.TestCase):
             sources = self._make_files(root, (("small.txt", 3000), ("movie.mkv", 3_000_000), ("tail.bin", 9000)))
             receiver, _ = self._start_receiver(save)
             try:
-                with patch.object(satlink, "PARALLEL_MIN", 1_000_000):
+                with patch.object(satlink, "PARALLEL_MIN", 1_000_000), patch.object(satlink, "BIG_FILE", 2_000_000):
                     bus = Bus(); satlink.Sender(bus)._send_android_protocol("127.0.0.1", satlink.ANDROID_TCP_PORT, [str(p) for p in sources])
                     self._assert_saved(save, sources)
                     self.assertFalse(any("فشل" in m for m in bus.log.values))

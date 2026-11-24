@@ -155,6 +155,10 @@ public class SendService extends Service implements SenderClient.Listener {
         update(L.t("إرسال: ", "Sending: ") + name + " · " + p + "% · " + NetworkUtils.formatSpeed(speed), p);
     }
 
+    @Override public void onParts(String batch, String name, int[] percents) {
+        TransferLog.parts(this, TransferLog.SEND, batch, name, percents);
+    }
+
     @Override public void onFileFinished(String batch, String name) {
         TransferLog.finish(this, TransferLog.SEND, batch, name, TransferLog.STATE_DONE, null);
     }
