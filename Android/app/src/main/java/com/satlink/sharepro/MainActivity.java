@@ -85,6 +85,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
     private SatLinkNsdHelper nsdHelper;
     private UdpDiscoveryHelper udpHelper;
     private VirtualNetwork vnet;
+    private SubnetScanner subnetScanner;
     private boolean searching;
     private TextView selectionText;
     private LinearLayout devicesBox;
@@ -118,6 +119,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         nsdHelper = new SatLinkNsdHelper(this);
         udpHelper = new UdpDiscoveryHelper(this);
         vnet = new VirtualNetwork(this);
+        subnetScanner = new SubnetScanner(this);
         configureWindow();
         requestNeededPermissions();
         if (!handleIntent(getIntent())) showHome();
@@ -464,6 +466,8 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
             @Override public void onLog(String m) { }
             @Override public void onTargetFound(VirtualNetwork.Target t) { addTarget(t); }
         });
+        // بحث مباشر بكل العناوين: يلگى الحاسبة حتى لو جدار حماية Windows منع النداء الجماعي.
+        subnetScanner.start(this::addLan);
         ui.postDelayed(() -> {
             if (searching && lanDevices.isEmpty() && p2pTargets.isEmpty())
                 setScan(L.t("لم يظهر جهاز بعد. افتح «استلام» في الجهاز الثاني، أو استخدم IP يدوي.",
@@ -476,6 +480,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         try { nsdHelper.stopDiscovery(); } catch (Exception ignored) {}
         try { udpHelper.stopScan(); } catch (Exception ignored) {}
         try { vnet.stopSearching(); } catch (Exception ignored) {}
+        try { subnetScanner.stop(); } catch (Exception ignored) {}
     }
 
     private void setScan(String s) { if (scanText != null) scanText.setText(s); }
@@ -650,6 +655,7 @@ public class MainActivity extends Activity implements TransferLog.Listener, Rece
         dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             String ip = input.getText().toString().trim();
             if (!isIpv4(ip)) { toast(L.t("اكتب عنوان IPv4 صحيح", "Enter a valid IPv4 address")); return; }
+            subnetScanner.remember(ip);
             addLan(new DeviceInfo("SatLink · " + ip, ip, NetworkUtils.PORT));
             dialog.dismiss();
         }));

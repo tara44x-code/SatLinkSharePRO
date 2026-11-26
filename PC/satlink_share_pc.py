@@ -14,7 +14,7 @@ except ImportError:
     QT_BINDING = "PyQt5"
 
 APP_NAME = "SatLink Share PRO"
-APP_VERSION = "5.1"
+APP_VERSION = "5.2"
 DEVELOPER = "مهند سات لنك"
 ANDROID_TCP_PORT = 8988
 ANDROID_UDP_PORT = 8989
@@ -156,6 +156,19 @@ def local_ipv4_addresses():
     except OSError:
         pass
     return ips
+
+def known_devices():
+    """Devices found or typed before; checked first on every search."""
+    data = load_settings().get("known_devices", [])
+    return [d for d in data if isinstance(d, dict) and isinstance(d.get("ip"), str)][:20] if isinstance(data, list) else []
+
+_known_lock = threading.Lock()
+def remember_device(name, ip, port):
+    with _known_lock:
+        devices = [d for d in known_devices() if d.get("ip") != ip]
+        devices.insert(0, {"name": name, "ip": ip, "port": int(port), "seen": int(time.time())})
+        try: save_settings({"known_devices": devices[:20]})
+        except OSError: pass
 
 def network_label(ip: str) -> str:
     if ip.startswith("192.168.49."): return "شبكة SatLink (هاتف)"
@@ -755,11 +768,16 @@ class Discovery:
         self.devices = {}
 
     def start(self):
-        self.stop_event.clear()
-        self.devices = {}
-        threading.Thread(target=self._scan_android_devices, daemon=True).start()
+        self.stop_event.set()                 # end a previous scan
+        self.stop_event = threading.Event()
+        self.devices = {}; self.lock = threading.Lock()
+        stop = self.stop_event
+        # Everything runs at the same time: devices seen before are checked first (instant),
+        # then UDP broadcast and a direct check of every address on each network.
+        threading.Thread(target=self._probe_known, args=(stop,), daemon=True).start()
+        threading.Thread(target=self._udp_scan, daemon=True).start()
+        threading.Thread(target=self._subnet_ping_scan, args=(stop,), daemon=True).start()
         self.bus.log.emit("بدأ البحث عن الأجهزة القريبة والحاسبات القريبة...")
-        self.bus.log.emit("البحث الآن يستخدم UDP + فحص شبكة احتياطي حتى لا يعتمد على طريقة واحدة.")
 
     def stop(self):
         self.stop_event.set()
@@ -768,10 +786,44 @@ class Discovery:
         if not ip or ip in local_ipv4_addresses():
             return
         key = f"{ip}:{port}"
-        if key not in self.devices:
+        lock = getattr(self, "lock", None) or threading.Lock()
+        with lock:
+            if key in self.devices: return
             self.devices[key] = {"name": name or "SatLink Device", "ip": ip, "port": int(port)}
-            self.bus.devices.emit(list(self.devices.values()))
-            self.bus.log.emit(f"تم العثور على جهاز: {name} - {ip}:{port}")
+            devices = list(self.devices.values())
+        self.bus.devices.emit(devices)
+        self.bus.log.emit(f"تم العثور على جهاز: {name} - {ip}:{port}")
+        remember_device(name, ip, port)
+
+    @staticmethod
+    def probe(host, port=None, stop=None):
+        """Ask a SatLink receiver for its name over TCP (outbound only, so the Windows
+        firewall does not block it). Phones on Wi-Fi power saving can take a moment to answer."""
+        if stop is not None and stop.is_set(): return None
+        port = port or ANDROID_TCP_PORT
+        sock = None
+        try:
+            sock = socket.create_connection((host, port), timeout=0.9)
+            sock.settimeout(2.5)
+            write_utf(sock, PING_PROTOCOL)
+            name = read_utf(sock)
+            try: port = read_int(sock)
+            except Exception: pass
+            return {"name": name or "SatLink Device", "ip": host, "port": int(port)}
+        except Exception:
+            return None
+        finally:
+            try:
+                if sock: sock.close()
+            except Exception: pass
+
+    def _probe_known(self, stop):
+        for dev in known_devices():
+            if stop.is_set(): return
+            threading.Thread(target=lambda d=dev: self._found(self.probe(d["ip"], d.get("port"), stop)), daemon=True).start()
+
+    def _found(self, dev):
+        if dev: self._add_device(dev["name"], dev["ip"], dev["port"])
 
     def _udp_scan(self):
         # One socket per network adapter: Windows sends 255.255.255.255 out of a single
@@ -822,51 +874,37 @@ class Discovery:
                 try: s.close()
                 except OSError: pass
 
-    def _subnet_ping_scan(self):
+    def _subnet_ping_scan(self, stop=None):
+        stop = stop or self.stop_event
         prefixes = []
-        for ip in local_ipv4_addresses():
+        addresses = local_ipv4_addresses() + [d["ip"] for d in known_devices()]
+        for ip in addresses:
             parts = ip.split(".")
-            if len(parts) == 4 and not ip.startswith("169.254."):
+            if len(parts) == 4 and not ip.startswith(("169.254.", "127.")):
                 prefix = ".".join(parts[:3])
                 if prefix not in prefixes: prefixes.append(prefix)
         if not prefixes:
             self.bus.log.emit("تعذر معرفة شبكة الحاسبة للفحص الاحتياطي.")
             return
         own = set(local_ipv4_addresses())
-        hosts = [f"{prefix}.{n}" for prefix in prefixes[:4] for n in range(1, 255)]
+        hosts = [f"{prefix}.{n}" for prefix in prefixes[:6] for n in range(1, 255)]
         hosts = [h for h in hosts if h not in own]
-
-        def probe(host):
-            if self.stop_event.is_set(): return None
-            sock = None
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(0.25)
-                sock.connect((host, ANDROID_TCP_PORT))
-                write_utf(sock, PING_PROTOCOL)
-                name = read_utf(sock)
-                try: port = read_int(sock)
-                except Exception: port = ANDROID_TCP_PORT
-                return {"name": name or "SatLink Device", "ip": host, "port": int(port)}
-            except Exception:
-                return None
-            finally:
-                try:
-                    if sock: sock.close()
-                except Exception: pass
-
-        lock = threading.Lock(); index = {"value": 0}
-        def worker():
-            while not self.stop_event.is_set():
-                with lock:
-                    i = index["value"]; index["value"] += 1
-                if i >= len(hosts): return
-                dev = probe(hosts[i])
-                if dev: self._add_device(dev["name"], dev["ip"], dev["port"])
-        threads = [threading.Thread(target=worker, daemon=True) for _ in range(48)]
-        for t in threads: t.start()
-        deadline = time.time() + 12
-        for t in threads: t.join(max(0.05, deadline - time.time()))
+        for attempt in range(2):          # a second pass catches phones that were asleep
+            if stop.is_set(): return
+            lock = threading.Lock(); index = {"value": 0}
+            todo = [h for h in hosts if f"{h}:{ANDROID_TCP_PORT}" not in self.devices]
+            def worker():
+                while not stop.is_set():
+                    with lock:
+                        i = index["value"]; index["value"] += 1
+                    if i >= len(todo): return
+                    self._found(self.probe(todo[i], None, stop))
+            threads = [threading.Thread(target=worker, daemon=True) for _ in range(96)]
+            for t in threads: t.start()
+            deadline = time.time() + 20
+            for t in threads: t.join(max(0.05, deadline - time.time()))
+        if not self.devices and not stop.is_set():
+            self.bus.log.emit("لم يظهر جهاز. افتح الاستقبال في الجهاز الآخر، أو استخدم IP يدوي.")
 
 class _LegacyReceiver(Exception): pass
 class _Rejected(Exception): pass
@@ -1198,6 +1236,16 @@ def start_control_server(bus, srv):
                 continue
     threading.Thread(target=serve, daemon=True).start()
 
+def allow_in_firewall() -> bool:
+    """Adds an inbound rule for SatLink (Windows asks for permission). Without it Windows may
+    silently block discovery replies and incoming transfers, especially on 'Public' networks."""
+    if not sys.platform.startswith("win"): return False
+    import ctypes
+    program = str(Path(sys.executable).resolve())
+    args = (f'advfirewall firewall add rule name="SatLink Share PRO" dir=in action=allow '
+            f'program="{program}" enable=yes profile=any')
+    return ctypes.windll.shell32.ShellExecuteW(None, "runas", "netsh", args, None, 0) > 32
+
 def shell_command():
     return legacy_startup_command() + ' --send "%1"'
 
@@ -1476,8 +1524,12 @@ class MainWindow(QMainWindow):
         self.parallel_toggle = QCheckBox(tr("تسريع الملفات الكبيرة (عدة اتصالات)", "Speed up large files (several connections)")); self.parallel_toggle.setChecked(ui_setting("parallel", True))
         self.menu_toggle = QCheckBox(tr("إضافة «إرسال بـ SatLink» لقائمة الزر الأيمن في Windows", "Add “Send with SatLink” to the Windows right-click menu"))
         self.menu_toggle.setChecked(explorer_menu_installed()); self.menu_toggle.setEnabled(sys.platform.startswith("win"))
+        self.btn_firewall = QPushButton(tr("🛡 السماح لـ SatLink بجدار حماية Windows", "🛡 Allow SatLink in Windows Firewall"))
+        self.btn_firewall.setEnabled(sys.platform.startswith("win"))
+        fw_note = QLabel(tr("إذا البحث ما يلگى الأجهزة بس الـ IP اليدوي يشتغل، اضغط هذا الزر مرة وحدة.",
+                            "If search finds nothing but a manual IP works, press this once.")); fw_note.setObjectName("Muted"); fw_note.setWordWrap(True)
         enc = QLabel(tr("🔒 التشفير مفعل", "🔒 Encryption on") if encryption_available() else tr("⚠ التشفير غير متوفر بهذه النسخة", "⚠ Encryption unavailable in this build")); enc.setObjectName("Muted")
-        for w in (self.ask_toggle, self.parallel_toggle, self.menu_toggle, enc): sev.addWidget(w)
+        for w in (self.ask_toggle, self.parallel_toggle, self.menu_toggle, self.btn_firewall, fw_note, enc): sev.addWidget(w)
         trust, tl = self._panel(tr("الأجهزة الموثوقة", "Trusted devices"))
         self.trusted_list = QListWidget(); self.btn_forget = QPushButton(tr("حذف الجهاز المحدد", "Remove selected")); self.btn_forget.setObjectName("Danger")
         tl.addWidget(self.trusted_list, 1); tl.addWidget(self.btn_forget)
@@ -1506,6 +1558,7 @@ class MainWindow(QMainWindow):
         self.parallel_toggle.toggled.connect(self.toggle_parallel)
         self.menu_toggle.toggled.connect(self.toggle_menu)
         self.btn_forget.clicked.connect(self.forget_selected)
+        self.btn_firewall.clicked.connect(self.fix_firewall)
         self.bus.log.connect(self.add_log); self.bus.devices.connect(self.update_devices); self.bus.receiving_state.connect(self.update_receiving_state)
         self.bus.transfer.connect(self.update_transfer); self.bus.verify.connect(self.show_code)
         self.bus.incoming.connect(self.ask_incoming); self.bus.external_send.connect(self.select_paths)
@@ -1547,8 +1600,9 @@ class MainWindow(QMainWindow):
         self.discovery.stop(); self.device_list.clear()
         self.scan_label.setText(tr("جاري البحث على كل الشبكات المتصلة...", "Searching all connected networks..."))
         QTimer.singleShot(150, self.discovery.start)
-        QTimer.singleShot(13000, lambda: self.device_list.count() == 0 and self.scan_label.setText(
-            tr("لم يظهر جهاز. افتح «استلام» في الجهاز الثاني أو أضف IP يدوي.", "No device found. Open Receive on the other device or add its IP.")))
+        QTimer.singleShot(15000, lambda: self.device_list.count() == 0 and self.scan_label.setText(
+            tr("لم يظهر جهاز. تأكد أن «استلام» مفتوح بالجهاز الثاني وعلى نفس الشبكة، أو اضغط ⚙ الإعدادات ← «السماح لـ SatLink بجدار حماية Windows»، أو أضف IP يدوي (يُحفظ ويظهر تلقائياً بالمرات الجاية).",
+               "No device found. Make sure Receive is open on the other device on the same network, or open ⚙ Settings → “Allow SatLink in Windows Firewall”, or add its IP (it is remembered next time).")))
     def update_devices(self, devices):
         self.device_list.clear()
         for dev in devices:
@@ -1698,6 +1752,12 @@ class MainWindow(QMainWindow):
         try: set_explorer_menu(on)
         except OSError:
             self.menu_toggle.blockSignals(True); self.menu_toggle.setChecked(not on); self.menu_toggle.blockSignals(False)
+    def fix_firewall(self):
+        ok = False
+        try: ok = allow_in_firewall()
+        except Exception: ok = False
+        QMessageBox.information(self, "SatLink", tr("تمت إضافة السماح. ارجع للإرسال واضغط «بحث».", "Allowed. Go back to Send and press Scan.")
+                                if ok else tr("لم تتم الموافقة على طلب Windows.", "Windows permission was not granted."))
     def forget_selected(self):
         for item in self.trusted_list.selectedItems():
             device = item.data(Qt.UserRole)

@@ -480,6 +480,35 @@ class ProtocolTests(unittest.TestCase):
             finally:
                 receiver.stop()
 
+    def test_discovery_finds_slow_phone_and_remembers_it(self):
+        """A phone on Wi-Fi power saving that answers after 0.7 s is still found, and
+        devices found (or typed) before are checked first on the next search."""
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(satlink, "settings_path", return_value=Path(temp) / "settings.json"):
+                srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(4); port = srv.getsockname()[1]
+                def slow_phone():
+                    while True:
+                        try: conn, _ = srv.accept()
+                        except OSError: return
+                        with conn:
+                            if satlink.read_utf(conn) == satlink.PING_PROTOCOL:
+                                time.sleep(0.7)
+                                satlink.write_utf(conn, "SatLink - Slow Phone"); satlink.write_int(conn, port)
+                threading.Thread(target=slow_phone, daemon=True).start()
+                try:
+                    self.assertEqual(satlink.Discovery.probe("127.0.0.1", port)["name"], "SatLink - Slow Phone")
+                    satlink.remember_device("SatLink - Slow Phone", "127.0.0.1", port)
+                    bus = Bus(); d = satlink.Discovery(bus)
+                    with patch.object(satlink, "local_ipv4_addresses", return_value=["10.255.255.1"]), \
+                         patch.object(satlink.Discovery, "_udp_scan", lambda self: None), \
+                         patch.object(satlink.Discovery, "_subnet_ping_scan", lambda self, stop=None: None):
+                        d.start()
+                        self._wait_for(lambda: bool(bus.devices.values))
+                    d.stop()
+                    self.assertEqual(bus.devices.values[-1][0]["name"], "SatLink - Slow Phone")
+                finally:
+                    srv.close()
+
     def _wait_for(self, predicate):
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
